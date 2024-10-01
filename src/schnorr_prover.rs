@@ -1,18 +1,12 @@
 use anyhow::Result;
 
+use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
+use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::iop::{
     target::{BoolTarget, Target},
     witness::{PartialWitness, WitnessWrite},
 };
-use plonky2::field::{
-    goldilocks_field::GoldilocksField,
-    types::Field,
-};
-use plonky2::hash::poseidon::PoseidonHash;
-use plonky2::plonk::{
-    circuit_builder::CircuitBuilder,
-    config::GenericConfig,
-};
+use plonky2::plonk::{circuit_builder::CircuitBuilder, config::GenericConfig};
 
 use crate::{
     mod65537::Mod65537Builder,
@@ -57,7 +51,7 @@ impl SchnorrSignatureTarget {
     fn new_virtual(builder: &mut CircuitBuilder<GoldF, 2>) -> Self {
         let s = builder.add_virtual_target();
         let e = builder.add_virtual_target();
-        Self{ s, e }
+        Self { s, e }
     }
 
     fn set_witness(&self, pw: &mut PartialWitness<GoldF>, sig: &SchnorrSignature) -> Result<()> {
@@ -73,7 +67,9 @@ pub struct SchnorrPublicKeyTarget {
 
 impl SchnorrPublicKeyTarget {
     fn new_virtual(builder: &mut CircuitBuilder<GoldF, 2>) -> Self {
-        Self{ pk: builder.add_virtual_target() }
+        Self {
+            pk: builder.add_virtual_target(),
+        }
     }
 
     fn set_witness(&self, pw: &mut PartialWitness<GoldF>, pk: &SchnorrPublicKey) -> Result<()> {
@@ -85,21 +81,17 @@ impl SchnorrPublicKeyTarget {
 pub struct SchnorrBuilder {}
 
 pub trait SignatureVerifierBuilder {
-    fn constrain_sig <
-        C: GenericConfig<2, F = GoldF>,
-    > (
+    fn constrain_sig<C: GenericConfig<2, F = GoldF>>(
         &self,
-        builder: &mut CircuitBuilder::<GoldF, 2>,
+        builder: &mut CircuitBuilder<GoldF, 2>,
         sig: &SchnorrSignatureTarget,
         msg: &MessageTarget,
         pk: &SchnorrPublicKeyTarget,
     );
 
-    fn verify_sig <
-        C: GenericConfig<2, F = GoldF>,
-    > (
+    fn verify_sig<C: GenericConfig<2, F = GoldF>>(
         &self,
-        builder: &mut CircuitBuilder::<GoldF, 2>,
+        builder: &mut CircuitBuilder<GoldF, 2>,
         sig: &SchnorrSignatureTarget,
         msg: &MessageTarget,
         pk: &SchnorrPublicKeyTarget,
@@ -107,11 +99,9 @@ pub trait SignatureVerifierBuilder {
 }
 
 impl SignatureVerifierBuilder for SchnorrBuilder {
-    fn constrain_sig <
-        C: GenericConfig<2, F = GoldF>,
-    > (
+    fn constrain_sig<C: GenericConfig<2, F = GoldF>>(
         &self,
-        builder: &mut CircuitBuilder::<GoldF, 2>,
+        builder: &mut CircuitBuilder<GoldF, 2>,
         sig: &SchnorrSignatureTarget,
         msg: &MessageTarget,
         pk: &SchnorrPublicKeyTarget,
@@ -121,16 +111,15 @@ impl SignatureVerifierBuilder for SchnorrBuilder {
         builder.connect(verification_output.target, true_target.target);
     }
 
-    fn verify_sig <
-        C: GenericConfig<2, F = GoldF>,
-    > (
+    fn verify_sig<C: GenericConfig<2, F = GoldF>>(
         &self,
-        builder: &mut CircuitBuilder::<GoldF, 2>,
+        builder: &mut CircuitBuilder<GoldF, 2>,
         sig: &SchnorrSignatureTarget,
         msg: &MessageTarget,
         pk: &SchnorrPublicKeyTarget,
     ) -> BoolTarget {
-        let PRIME_GROUP_GEN: Target = builder.constant(GoldF::from_canonical_u64(6612579038192137166));
+        let PRIME_GROUP_GEN: Target =
+            builder.constant(GoldF::from_canonical_u64(6612579038192137166));
         let PRIME_GROUP_ORDER: Target = builder.constant(GoldF::from_canonical_u64(65537));
         const num_bits_exp: usize = 32;
 
@@ -147,12 +136,10 @@ impl SignatureVerifierBuilder for SchnorrBuilder {
 
         // compute hash
         // note that it's safe to clone Targets since they just contain indices
-        let hash_input: Vec<Target> = std::iter::once(r)
-            .chain(msg.msg.iter().cloned()) 
-            .collect();
-        let hash_output: Target = builder.hash_n_to_hash_no_pad::<PoseidonHash>(
-            hash_input,
-        ).elements[0]; // whoops have to take mod group order;
+        let hash_input: Vec<Target> = std::iter::once(r).chain(msg.msg.iter().cloned()).collect();
+        let hash_output: Target = builder
+            .hash_n_to_hash_no_pad::<PoseidonHash>(hash_input)
+            .elements[0]; // whoops have to take mod group order;
 
         let e: Target = Mod65537Builder::mod_65537(builder, hash_output);
 
@@ -162,16 +149,19 @@ impl SignatureVerifierBuilder for SchnorrBuilder {
 }
 
 #[cfg(test)]
-mod tests{
-    use crate::schnorr::{SchnorrPublicKey, SchnorrSecretKey, SchnorrSigner, SchnorrSignature};
-    use crate::schnorr_prover::{MessageTarget, SchnorrBuilder, SchnorrPublicKeyTarget, SchnorrSignatureTarget, SignatureVerifierBuilder};
+mod tests {
+    use crate::schnorr::{SchnorrPublicKey, SchnorrSecretKey, SchnorrSignature, SchnorrSigner};
+    use crate::schnorr_prover::{
+        MessageTarget, SchnorrBuilder, SchnorrPublicKeyTarget, SchnorrSignatureTarget,
+        SignatureVerifierBuilder,
+    };
+    use plonky2::field::goldilocks_field::GoldilocksField;
     use plonky2::iop::witness::PartialWitness;
     use plonky2::plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::CircuitConfig,
         config::{GenericConfig, PoseidonGoldilocksConfig},
     };
-    use plonky2::field::goldilocks_field::GoldilocksField;
     use rand;
 
     #[test]
@@ -185,15 +175,13 @@ mod tests{
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
 
-        let sb: SchnorrBuilder = SchnorrBuilder{};
+        let sb: SchnorrBuilder = SchnorrBuilder {};
 
         // create keypair, message, signature
-        let sk: SchnorrSecretKey = SchnorrSecretKey{ sk: 133 };
+        let sk: SchnorrSecretKey = SchnorrSecretKey { sk: 133 };
         let ss = SchnorrSigner::new();
         let pk: SchnorrPublicKey = ss.keygen(&sk);
-        let msg: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(
-            vec![1500, 1600, 0, 0, 0]
-        );
+        let msg: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(vec![1500, 1600, 0, 0, 0]);
         let msg_size: usize = msg.len();
         let sig: SchnorrSignature = ss.sign(&msg, &sk, &mut rng);
 
@@ -201,19 +189,13 @@ mod tests{
         let sig_targ = SchnorrSignatureTarget::new_virtual(&mut builder);
         let msg_targ = MessageTarget::new_with_size(&mut builder, msg_size);
 
-        sb.constrain_sig::<PoseidonGoldilocksConfig> (
-            &mut builder,
-            &sig_targ,
-            &msg_targ,
-            &pk_targ
-        );
+        sb.constrain_sig::<PoseidonGoldilocksConfig>(&mut builder, &sig_targ, &msg_targ, &pk_targ);
 
         // assign witnesses for verification
         let mut pw: PartialWitness<F> = PartialWitness::new();
         pk_targ.set_witness(&mut pw, &pk).unwrap();
         sig_targ.set_witness(&mut pw, &sig).unwrap();
         msg_targ.set_witness(&mut pw, &msg).unwrap();
-
 
         let data = builder.build::<C>();
         let proof = data.prove(pw).unwrap();
@@ -230,32 +212,24 @@ mod tests{
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
 
-        let sb: SchnorrBuilder = SchnorrBuilder{};
+        let sb: SchnorrBuilder = SchnorrBuilder {};
 
         // create keypair, message, signature
-        let sk: SchnorrSecretKey = SchnorrSecretKey{ sk: 133 };
+        let sk: SchnorrSecretKey = SchnorrSecretKey { sk: 133 };
         let ss = SchnorrSigner::new();
         let pk: SchnorrPublicKey = ss.keygen(&sk);
-        let msg0: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(
-            vec![1500, 1600, 0, 0, 0]
-        );
+        let msg0: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(vec![1500, 1600, 0, 0, 0]);
         let msg_size: usize = msg0.len();
         let sig: SchnorrSignature = ss.sign(&msg0, &sk, &mut rng);
 
-        let msg1: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(
-            vec![1510, 1600, 0, 0, 0]
-        );
+        let msg1: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(vec![1510, 1600, 0, 0, 0]);
 
         let pk_targ = SchnorrPublicKeyTarget::new_virtual(&mut builder);
         let sig_targ = SchnorrSignatureTarget::new_virtual(&mut builder);
         let msg_targ = MessageTarget::new_with_size(&mut builder, msg_size);
 
-        let verification_result = sb.verify_sig::<PoseidonGoldilocksConfig> (
-            &mut builder,
-            &sig_targ,
-            &msg_targ,
-            &pk_targ
-        );
+        let verification_result =
+            sb.verify_sig::<PoseidonGoldilocksConfig>(&mut builder, &sig_targ, &msg_targ, &pk_targ);
 
         // assign witnesses for verification
         let mut pw: PartialWitness<F> = PartialWitness::new();
@@ -283,32 +257,24 @@ mod tests{
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<F, D>::new(config);
 
-        let sb: SchnorrBuilder = SchnorrBuilder{};
+        let sb: SchnorrBuilder = SchnorrBuilder {};
 
         // create keypair, message, signature
-        let sk: SchnorrSecretKey = SchnorrSecretKey{ sk: 133 };
+        let sk: SchnorrSecretKey = SchnorrSecretKey { sk: 133 };
         let ss = SchnorrSigner::new();
         let pk: SchnorrPublicKey = ss.keygen(&sk);
-        let msg0: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(
-            vec![1500, 1600, 0, 0, 0]
-        );
+        let msg0: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(vec![1500, 1600, 0, 0, 0]);
         let msg_size: usize = msg0.len();
         let sig: SchnorrSignature = ss.sign(&msg0, &sk, &mut rng);
 
-        let msg1: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(
-            vec![1510, 1600, 0, 0, 0]
-        );
+        let msg1: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(vec![1510, 1600, 0, 0, 0]);
 
         let pk_targ = SchnorrPublicKeyTarget::new_virtual(&mut builder);
         let sig_targ = SchnorrSignatureTarget::new_virtual(&mut builder);
         let msg_targ = MessageTarget::new_with_size(&mut builder, msg_size);
 
-        let verification_result = sb.verify_sig::<PoseidonGoldilocksConfig> (
-            &mut builder,
-            &sig_targ,
-            &msg_targ,
-            &pk_targ
-        );
+        let verification_result =
+            sb.verify_sig::<PoseidonGoldilocksConfig>(&mut builder, &sig_targ, &msg_targ, &pk_targ);
 
         // assign witnesses for verification
         let mut pw: PartialWitness<F> = PartialWitness::new();

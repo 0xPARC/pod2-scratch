@@ -1,18 +1,15 @@
 use anyhow::Result;
 
+use plonky2::field::{
+    goldilocks_field::GoldilocksField,
+    types::{Field, PrimeField64},
+};
 use plonky2::iop::{
     generator::{GeneratedValues, SimpleGenerator},
     target::Target,
     witness::{PartitionWitness, Witness, WitnessWrite},
 };
-use plonky2::field::{
-    goldilocks_field::GoldilocksField,
-    types::{Field, PrimeField64},
-};
-use plonky2::plonk::{
-    circuit_builder::CircuitBuilder,
-    circuit_data::CommonCircuitData,
-};
+use plonky2::plonk::{circuit_builder::CircuitBuilder, circuit_data::CommonCircuitData};
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::schnorr::{SchnorrPublicKey, SchnorrSignature};
@@ -52,7 +49,11 @@ impl SimpleGenerator<GoldF, 2> for Mod65537Generator {
         Ok(())
     }
 
-    fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<GoldF, 2>) -> IoResult<()> {
+    fn serialize(
+        &self,
+        dst: &mut Vec<u8>,
+        common_data: &CommonCircuitData<GoldF, 2>,
+    ) -> IoResult<()> {
         dst.write_target(self.a)?;
         dst.write_target(self.q)?;
         dst.write_target(self.r)?;
@@ -61,12 +62,12 @@ impl SimpleGenerator<GoldF, 2> for Mod65537Generator {
 
     fn deserialize(src: &mut Buffer, common_data: &CommonCircuitData<GoldF, 2>) -> IoResult<Self>
     where
-        Self: Sized 
+        Self: Sized,
     {
-            let a = src.read_target()?;
-            let q = src.read_target()?;
-            let r = src.read_target()?;
-            Ok(Self { a, q, r })
+        let a = src.read_target()?;
+        let q = src.read_target()?;
+        let r = src.read_target()?;
+        Ok(Self { a, q, r })
     }
 }
 
@@ -84,15 +85,12 @@ impl Mod65537Builder {
     // (these first two checks guarantee that a lies in the range [0, p + 65536])
     // if q = floor(p / 65537) then r = 0
     // (note that p % 65537 == 1 so this is the only possibility)
-    pub(crate) fn mod_65537 (
-        builder: &mut CircuitBuilder::<GoldF, 2>,
-        a: Target,
-    ) -> Target {
+    pub(crate) fn mod_65537(builder: &mut CircuitBuilder<GoldF, 2>, a: Target) -> Target {
         let q = builder.add_virtual_target();
         let r = builder.add_virtual_target();
 
         // the Mod65537Generator will assign values to q and r later
-        builder.add_simple_generator( Mod65537Generator { a, q, r } );
+        builder.add_simple_generator(Mod65537Generator { a, q, r });
 
         // impose four constraints
         // 1. a = 65537 * q + r
@@ -120,7 +118,7 @@ impl Mod65537Builder {
         builder.connect(prod_temp, zero_temp);
 
         // throw in the Generator to tell builder how to compute r
-        builder.add_simple_generator( Mod65537Generator {a, q, r} );
+        builder.add_simple_generator(Mod65537Generator { a, q, r });
 
         r
     }
@@ -129,24 +127,18 @@ impl Mod65537Builder {
 #[cfg(test)]
 mod tests {
     use crate::mod65537::Mod65537Builder;
-    use plonky2::iop::{
-        target::Target,
-        witness::PartialWitness,
-    };
+    use plonky2::field::{goldilocks_field::GoldilocksField, types::Field};
+    use plonky2::iop::{target::Target, witness::PartialWitness};
     use plonky2::plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::CircuitConfig,
         config::{GenericConfig, PoseidonGoldilocksConfig},
     };
-    use plonky2::field::{
-        goldilocks_field::GoldilocksField,
-        types::Field,
-    };
 
     #[test]
     fn test_mod65537() -> () {
         const D: usize = 2;
-        const p: u64 = 18446744069414584321;  // the Goldilocks prime
+        const p: u64 = 18446744069414584321; // the Goldilocks prime
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
 
@@ -160,7 +152,8 @@ mod tests {
             .map(|x| builder.constant(GoldilocksField::from_canonical_u64(*x)))
             .collect();
 
-        let r: Vec<Target> = a.iter()
+        let r: Vec<Target> = a
+            .iter()
             .map(|targ| Mod65537Builder::mod_65537(&mut builder, *targ))
             .collect();
 
@@ -168,12 +161,14 @@ mod tests {
         // obviously you don't need this in your own code
         let r_expected64: Vec<u64> = a64.iter().map(|x| x % 65537).collect();
         println!("Expected residues mod 64: {:?}", r_expected64);
-        let r_expected: Vec<Target> = r_expected64.iter()
+        let r_expected: Vec<Target> = r_expected64
+            .iter()
             .map(|x| builder.constant(GoldilocksField::from_canonical_u64(*x)))
             .collect();
-        r.iter().zip(r_expected.iter())
+        r.iter()
+            .zip(r_expected.iter())
             .for_each(|(x, y)| builder.connect(*x, *y));
-        
+
         let mut pw: PartialWitness<F> = PartialWitness::new();
         let data = builder.build::<C>();
         let proof = data.prove(pw).unwrap();

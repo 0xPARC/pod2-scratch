@@ -1,8 +1,8 @@
-use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
-use plonky2::plonk::config::Hasher;
 use plonky2::field::types::PrimeField64;
+use plonky2::hash::poseidon::PoseidonHash;
+use plonky2::plonk::config::Hasher;
 use rand;
 use rand::Rng;
 
@@ -38,12 +38,15 @@ pub struct SchnorrSignature {
     pub e: u64,
 }
 
-impl SchnorrSigner{
+impl SchnorrSigner {
     pub fn new() -> Self {
         let quotient_order: u64 = (1 << 48) - (1 << 32);
         let PRIME_GROUP_GEN: GoldilocksField = Self::pow(BIG_GROUP_GEN, quotient_order);
         let PRIME_GROUP_ORDER: u64 = (1 << 16) + 1;
-        SchnorrSigner{PRIME_GROUP_GEN, PRIME_GROUP_ORDER}
+        SchnorrSigner {
+            PRIME_GROUP_GEN,
+            PRIME_GROUP_ORDER,
+        }
     }
 
     fn pow(x: GoldilocksField, a: u64) -> GoldilocksField {
@@ -63,14 +66,12 @@ impl SchnorrSigner{
     pub fn keygen(&self, sk: &SchnorrSecretKey) -> SchnorrPublicKey {
         let pk: GoldilocksField = Self::pow(self.PRIME_GROUP_GEN, sk.sk).inverse();
         // self.PRIME_GROUP_GEN is 6612579038192137166
-        SchnorrPublicKey{pk: pk}
+        SchnorrPublicKey { pk: pk }
     }
 
     fn hash_insecure(&self, r: &GoldilocksField, msg: &Vec<GoldilocksField>) -> u64 {
-        let poseidon_input: Vec<GoldilocksField> = std::iter::once(r)
-            .chain(msg.iter())
-            .copied()
-            .collect();
+        let poseidon_input: Vec<GoldilocksField> =
+            std::iter::once(r).chain(msg.iter()).copied().collect();
 
         let h = PoseidonHash::hash_no_pad(&poseidon_input);
         h.elements[0].to_canonical_u64() % self.PRIME_GROUP_ORDER
@@ -87,7 +88,12 @@ impl SchnorrSigner{
             .collect()
     }
 
-    pub fn sign(&self, msg: &Vec<GoldilocksField>, sk: &SchnorrSecretKey, rng: &mut rand::rngs::ThreadRng) -> SchnorrSignature {
+    pub fn sign(
+        &self,
+        msg: &Vec<GoldilocksField>,
+        sk: &SchnorrSecretKey,
+        rng: &mut rand::rngs::ThreadRng,
+    ) -> SchnorrSignature {
         let k: u64 = self.rand_group_multiplier(rng);
         let r: GoldilocksField = Self::pow(self.PRIME_GROUP_GEN, k);
         let e: u64 = self.hash_insecure(&r, msg);
@@ -97,12 +103,16 @@ impl SchnorrSigner{
         let mut s128: u128 = ((k as u128) + (sk.sk as u128) * (e as u128));
         s128 %= self.PRIME_GROUP_ORDER as u128;
         let s: u64 = s128 as u64;
-        SchnorrSignature{e, s}
+        SchnorrSignature { e, s }
     }
 
-    pub fn verify(&self, sig: &SchnorrSignature, msg: &Vec<GoldilocksField>, pk: &SchnorrPublicKey) -> bool {
-        let r: GoldilocksField = Self::pow(self.PRIME_GROUP_GEN, sig.s)
-            * Self::pow(pk.pk, sig.e);
+    pub fn verify(
+        &self,
+        sig: &SchnorrSignature,
+        msg: &Vec<GoldilocksField>,
+        pk: &SchnorrPublicKey,
+    ) -> bool {
+        let r: GoldilocksField = Self::pow(self.PRIME_GROUP_GEN, sig.s) * Self::pow(pk.pk, sig.e);
         let e_v: u64 = self.hash_insecure(&r, msg);
         e_v == sig.e
     }
@@ -112,7 +122,7 @@ impl SchnorrSigner{
 mod tests {
     use plonky2::field::goldilocks_field::GoldilocksField;
 
-    use crate::schnorr::{SchnorrPublicKey, SchnorrSecretKey, SchnorrSigner, SchnorrSignature};
+    use crate::schnorr::{SchnorrPublicKey, SchnorrSecretKey, SchnorrSignature, SchnorrSigner};
 
     #[test]
     fn test_pow() {
@@ -125,7 +135,7 @@ mod tests {
     fn test_sig() {
         let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
         let ss = SchnorrSigner::new();
-        let sk: SchnorrSecretKey = SchnorrSecretKey{ sk: 1422 };
+        let sk: SchnorrSecretKey = SchnorrSecretKey { sk: 1422 };
         let pk: SchnorrPublicKey = ss.keygen(&sk);
 
         let msg0_u64: Vec<u64> = vec![17, 123985, 3, 12];
