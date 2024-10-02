@@ -5,9 +5,66 @@ use plonky2::plonk::config::GenericHashOut;
 use plonky2::plonk::config::Hasher;
 use util::hash_string_to_field;
 
+use crate::schnorr::SchnorrPublicKey;
+use crate::schnorr::SchnorrSecretKey;
+use crate::schnorr::SchnorrSignature;
+use crate::schnorr::SchnorrSigner;
+
+use rand;
+use rand::Rng;
+
 mod util;
 
-pub trait EntryValue: Clone {
+pub(crate) type Error = Box<dyn std::error::Error>;
+
+pub trait HashablePayload: Clone + PartialEq {
+    fn to_field_vec(&self) -> Vec<GoldilocksField>;
+    fn hash_payload(&self) -> GoldilocksField;
+}
+
+impl<V: EntryValue> HashablePayload for Vec<Entry<V>> {
+    fn to_field_vec(&self) -> Vec<GoldilocksField> {
+        let mut sorted_by_key_name = self.clone();
+        sorted_by_key_name.sort_by(|a, b| a.key_name.cmp(&b.key_name));
+        let mut ins = Vec::new();
+        sorted_by_key_name.iter().for_each(|entry| {
+            ins.push(entry.key_hash);
+            ins.push(entry.value_hash);
+        });
+        ins
+    }
+
+    fn hash_payload(&self) -> GoldilocksField {
+        let ins = self.to_field_vec();
+        PoseidonHash::hash_no_pad(&ins).to_vec()[0]
+    }
+}
+
+pub trait ProofOf<Payload>: Clone {
+    fn verify(&self, payload: &Payload) -> Result<bool, Error>;
+}
+
+impl ProofOf<Vec<Entry<ScalarOrVec>>> for SchnorrSignature {
+    fn verify(&self, payload: &Vec<Entry<ScalarOrVec>>) -> Result<bool, Error> {
+        let payload_vec = payload.to_field_vec();
+        let protocol = SchnorrSigner::new();
+        let wrapped_pk = payload
+            .iter()
+            .filter(|entry| entry.key_name == "_signer")
+            .collect::<Vec<&Entry<ScalarOrVec>>>();
+        if wrapped_pk.len() == 0 {
+            return Err("No signer found in payload".into());
+        }
+
+        let pk = match wrapped_pk[0].value {
+            ScalarOrVec::Vector(_) => Err(Error::from("Signer is a vector")),
+            ScalarOrVec::Scalar(s) => Ok(s),
+        }?;
+        Ok(protocol.verify(&self, &payload_vec, &SchnorrPublicKey { pk }))
+    }
+}
+
+pub trait EntryValue: Clone + PartialEq {
     fn hash_or_value(&self) -> GoldilocksField;
 }
 
@@ -23,7 +80,23 @@ impl EntryValue for Vec<GoldilocksField> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScalarOrVec {
+    Scalar(GoldilocksField),
+    Vector(Vec<GoldilocksField>),
+}
+
+impl EntryValue for ScalarOrVec {
+    fn hash_or_value(&self) -> GoldilocksField {
+        match self {
+            Self::Scalar(s) => s.hash_or_value(),
+            Self::Vector(v) => v.hash_or_value(),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(usize)]
 pub enum GadgetID {
     NONE = 0,
     SCHNORR16 = 1,
@@ -36,7 +109,7 @@ pub struct Origin {
     pub gadget_id: Option<GadgetID>, // if origin_id is SELF, this is none; otherwise, it's the gadget_id
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Entry<V: EntryValue> {
     pub key_name: String,
     pub key_hash: GoldilocksField,
@@ -73,6 +146,52 @@ pub struct Statement {
     pub right_origin: Option<Origin>,
     pub right_key_name: Option<String>,
     pub optional_value: Option<GoldilocksField>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct POD<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usize> {
+    pub payload: Payload,
+    proof: Proof,
+}
+
+type SchnorrPOD = POD<Vec<Entry<ScalarOrVec>>, SchnorrSignature, { GadgetID::SCHNORR16 as usize }>;
+
+type GODPOD = POD<Vec<Entry<ScalarOrVec>>, SchnorrSignature, { GadgetID::GOD as usize }>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SchnorrOrGODPOD {
+    SchnorrPOD(SchnorrPOD),
+    GODPOD(GODPOD),
+}
+
+impl<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usize>
+    POD<Payload, Proof, FromGadgetID>
+{
+    pub fn verify(&self) -> Result<bool, Error> {
+        self.proof.verify(&self.payload)
+    }
+}
+
+impl SchnorrPOD {
+    pub fn new(entries: &Vec<Entry<ScalarOrVec>>, sk: &SchnorrSecretKey) -> Self {
+        let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
+        let protocol = SchnorrSigner::new();
+
+        let mut payload = entries.clone();
+        payload.push(Entry::new(
+            "_signer",
+            ScalarOrVec::Scalar(protocol.keygen(sk).pk),
+        ));
+        let payload_vec = entries.to_field_vec();
+        let proof = protocol.sign(&payload_vec, sk, &mut rng);
+        Self { payload, proof }
+    }
+}
+
+impl GODPOD {
+    pub fn from_pods(inputs: &Vec<SchnorrOrGODPOD>, operations: &Vec<Operation>) -> Self {
+        let mut payload = Vec::new();
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -369,7 +488,10 @@ fn op_test() {
     let mut expected_statement = unwrapped_gt_statement.clone();
     expected_statement.predicate = StatementPredicate::NotEqual;
     assert!(
-        Operation::GtToNonequality.apply_operation::<GoldilocksField>(Some(&unwrapped_gt_statement), None, None)
-            == Some(expected_statement)
-        );
+        Operation::GtToNonequality.apply_operation::<GoldilocksField>(
+            Some(&unwrapped_gt_statement),
+            None,
+            None
+        ) == Some(expected_statement)
+    );
 }

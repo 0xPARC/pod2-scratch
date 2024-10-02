@@ -15,24 +15,24 @@ const BIG_GROUP_GEN: GoldilocksField = GoldilocksField(14293326489335486720);
 // 8-bit security (i.e. totally insecure, DO NOT USE if you want any security at all)
 // because it uses the multiplicative group of the Goldilocks field
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SchnorrSigner {
     PRIME_GROUP_GEN: GoldilocksField,
     PRIME_GROUP_ORDER: u64,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 
 pub struct SchnorrSecretKey {
     pub sk: u64,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SchnorrPublicKey {
     pub pk: GoldilocksField,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SchnorrSignature {
     pub s: u64,
     pub e: u64,
