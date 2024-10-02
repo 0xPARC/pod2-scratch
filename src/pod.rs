@@ -1,4 +1,5 @@
 use plonky2::field::goldilocks_field::GoldilocksField;
+use plonky2::field::types::Field;
 use plonky2::field::types::PrimeField64;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::GenericHashOut;
@@ -19,7 +20,11 @@ pub(crate) type Error = Box<dyn std::error::Error>;
 
 pub trait HashablePayload: Clone + PartialEq {
     fn to_field_vec(&self) -> Vec<GoldilocksField>;
-    fn hash_payload(&self) -> GoldilocksField;
+
+    fn hash_payload(&self) -> GoldilocksField {
+        let ins = self.to_field_vec();
+        PoseidonHash::hash_no_pad(&ins).to_vec()[0]
+    }
 }
 
 impl<V: EntryValue> HashablePayload for Vec<Entry<V>> {
@@ -33,10 +38,48 @@ impl<V: EntryValue> HashablePayload for Vec<Entry<V>> {
         });
         ins
     }
+}
 
-    fn hash_payload(&self) -> GoldilocksField {
-        let ins = self.to_field_vec();
-        PoseidonHash::hash_no_pad(&ins).to_vec()[0]
+// TODO
+impl HashablePayload for Vec<Statement> {
+    fn to_field_vec(&self) -> Vec<GoldilocksField> {
+        self.iter()
+            .map(|statement| {
+                [
+                    vec![
+                        GoldilocksField(statement.predicate as u64),
+                        statement.left_origin.origin_id,
+                        GoldilocksField(match statement.left_origin.gadget_id {
+                            Some(x) => x as usize as u64,
+                            _ => 0,
+                        }),
+                        hash_string_to_field(&statement.left_key_name),
+                    ],
+                    match statement.right_origin {
+                        Some(ro) => vec![
+                            ro.origin_id,
+                            GoldilocksField(match ro.gadget_id {
+                                Some(gid) => gid as usize as u64,
+                                _ => 0,
+                            }),
+                        ],
+                        _ => vec![GoldilocksField(0), GoldilocksField(0)],
+                    },
+                    vec![
+                        match &statement.right_key_name {
+                            Some(rkn) => hash_string_to_field(&rkn),
+                            _ => GoldilocksField::ZERO,
+                        },
+                        match statement.optional_value {
+                            Some(x) => x,
+                            _ => GoldilocksField::ZERO,
+                        },
+                    ],
+                ]
+                .concat()
+            })
+            .collect::<Vec<Vec<GoldilocksField>>>()
+            .concat()
     }
 }
 
@@ -60,6 +103,30 @@ impl ProofOf<Vec<Entry<ScalarOrVec>>> for SchnorrSignature {
             ScalarOrVec::Vector(_) => Err(Error::from("Signer is a vector")),
             ScalarOrVec::Scalar(s) => Ok(s),
         }?;
+        Ok(protocol.verify(&self, &payload_vec, &SchnorrPublicKey { pk }))
+    }
+}
+
+// TODO
+impl ProofOf<Vec<Statement>> for SchnorrSignature {
+    fn verify(&self, payload: &Vec<Statement>) -> Result<bool, Error> {
+        let payload_vec = payload.to_field_vec();
+        let protocol = SchnorrSigner::new();
+        let wrapped_pk = payload
+            .iter()
+            .filter(|statement| {
+                statement.left_key_name == "_signer"
+                    && statement.left_origin.origin_id == GoldilocksField(1)
+                    && statement.optional_value.is_some()
+            })
+            .collect::<Vec<&Statement>>();
+        if wrapped_pk.len() == 0 {
+            return Err("No signer found in payload".into());
+        }
+
+        let pk = wrapped_pk[0]
+            .optional_value
+            .expect("Signer's public key is missing.");
         Ok(protocol.verify(&self, &payload_vec, &SchnorrPublicKey { pk }))
     }
 }
@@ -129,6 +196,7 @@ impl<V: EntryValue> Entry<V> {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u64)]
 pub enum StatementPredicate {
     None = 0,
     ValueOf = 1,
@@ -156,7 +224,7 @@ pub struct POD<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadg
 
 type SchnorrPOD = POD<Vec<Entry<ScalarOrVec>>, SchnorrSignature, { GadgetID::SCHNORR16 as usize }>;
 
-type GODPOD = POD<Vec<Entry<ScalarOrVec>>, SchnorrSignature, { GadgetID::GOD as usize }>;
+type GODPOD = POD<Vec<Statement>, SchnorrSignature, { GadgetID::GOD as usize }>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SchnorrOrGODPOD {
@@ -188,11 +256,37 @@ impl SchnorrPOD {
     }
 }
 
+// TODO
 impl GODPOD {
-    pub fn from_pods(inputs: &Vec<SchnorrOrGODPOD>, operations: &Vec<Operation>) -> Self {
-        let mut payload = Vec::new();
+    pub fn new(statements: &Vec<Statement>, sk: &SchnorrSecretKey) -> Self {
+        let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
+        let protocol = SchnorrSigner::new();
+
+        let mut payload = statements.clone();
+        payload.push(
+            Statement {
+                predicate: StatementPredicate::ValueOf,
+                left_origin: Origin {origin_id: GoldilocksField(1), gadget_id: None },
+                left_key_name: "_signer".to_string(),
+                right_origin: None,
+                right_key_name: None,
+                optional_value: Some(protocol.keygen(sk).pk)
+            }
+        );
+        let payload_vec = statements.to_field_vec();
+        let proof = protocol.sign(&payload_vec, sk, &mut rng);
+        Self { payload, proof }
     }
 }
+
+// impl GODPOD {
+//     // TODO
+//     pub fn from_pods(inputs: &Vec<SchnorrOrGODPOD>, operations: &Vec<Operation>) -> Self {
+//         // Check signatures.
+//         // Compile/arrange list of statements as Vec<Statement> (after converting each `Entry` into a `ValueOf` statement).
+//         // Construct GODPOD.
+//     }
+// }
 
 #[derive(Copy, Clone, Debug)]
 pub enum Operation {
