@@ -32,10 +32,14 @@ pub trait HashablePayload: Clone + PartialEq {
 
 impl<V: EntryValue> HashablePayload for Vec<Entry<V>> {
     fn to_field_vec(&self) -> Vec<GoldilocksField> {
-        let mut sorted_by_key_name = self.clone();
-        sorted_by_key_name.sort_by(|a, b| a.key_name.cmp(&b.key_name));
+        // let mut sorted_by_key_name = self.clone();
+        // sorted_by_key_name.sort_by(|a, b| a.key_name.cmp(&b.key_name));
         let mut ins = Vec::new();
-        sorted_by_key_name.iter().for_each(|entry| {
+        // sorted_by_key_name.iter().for_each(|entry| {
+        //     ins.push(entry.key_hash);
+        //     ins.push(entry.value_hash);
+        // });
+        self.iter().for_each(|entry| {
             ins.push(entry.key_hash);
             ins.push(entry.value_hash);
         });
@@ -81,9 +85,11 @@ pub trait ProofOf<Payload>: Clone {
     fn verify(&self, payload: &Payload) -> Result<bool, Error>;
 }
 
+// verify schnorr POD
 impl ProofOf<Vec<Entry<ScalarOrVec>>> for SchnorrSignature {
     fn verify(&self, payload: &Vec<Entry<ScalarOrVec>>) -> Result<bool, Error> {
-        let payload_vec = payload.to_field_vec();
+        let payload_hash = payload.hash_payload();
+        let payload_hash_vec = vec![payload_hash];
         let protocol = SchnorrSigner::new();
         let wrapped_pk = payload
             .iter()
@@ -97,31 +103,21 @@ impl ProofOf<Vec<Entry<ScalarOrVec>>> for SchnorrSignature {
             ScalarOrVec::Vector(_) => Err(Error::from("Signer is a vector")),
             ScalarOrVec::Scalar(s) => Ok(s),
         }?;
-        Ok(protocol.verify(&self, &payload_vec, &SchnorrPublicKey { pk }))
+        Ok(protocol.verify(&self, &payload_hash_vec, &SchnorrPublicKey { pk }))
     }
 }
 
-// TODO
+// verify GODPOD
 impl ProofOf<Vec<Statement>> for SchnorrSignature {
     fn verify(&self, payload: &Vec<Statement>) -> Result<bool, Error> {
-        let payload_vec = payload.to_field_vec();
+        let payload_hash = payload.hash_payload();
+        let payload_hash_vec = vec![payload_hash];
         let protocol = SchnorrSigner::new();
-        let wrapped_pk = payload
-            .iter()
-            .filter(|statement| {
-                statement.left_key_name == "_signer"
-                    && statement.left_origin.origin_id == GoldilocksField(1)
-                    && statement.optional_value.is_some()
-            })
-            .collect::<Vec<&Statement>>();
-        if wrapped_pk.len() == 0 {
-            return Err("No signer found in payload".into());
-        }
-
-        let pk = wrapped_pk[0]
-            .optional_value
-            .expect("Signer's public key is missing.");
-        Ok(protocol.verify(&self, &payload_vec, &SchnorrPublicKey { pk }))
+        Ok(protocol.verify(
+            &self,
+            &payload_hash_vec,
+            &protocol.keygen(&SchnorrSecretKey { sk: 0 }), // hardcoded secret key
+        ))
     }
 }
 
@@ -207,7 +203,7 @@ pub struct Statement {
     pub left_key_name: String,
     pub right_origin: Option<Origin>,
     pub right_key_name: Option<String>,
-    pub optional_value: Option<GoldilocksField>,
+    pub optional_value: Option<GoldilocksField>, // todo: figure out how to allow this to be any EntryValue
 }
 
 pub fn entry_to_statement<V: EntryValue>(entry: &Entry<V>, gadget_id: GadgetID) -> Statement {
@@ -249,7 +245,7 @@ impl<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usiz
 }
 
 impl SchnorrPOD {
-    pub fn new(entries: &Vec<Entry<ScalarOrVec>>, sk: &SchnorrSecretKey) -> Self {
+    pub fn gadget(entries: &Vec<Entry<ScalarOrVec>>, sk: &SchnorrSecretKey) -> Self {
         let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
         let protocol = SchnorrSigner::new();
 
@@ -258,8 +254,9 @@ impl SchnorrPOD {
             "_signer",
             ScalarOrVec::Scalar(protocol.keygen(sk).pk),
         ));
-        let payload_vec = payload.to_field_vec();
-        let proof = protocol.sign(&payload_vec, sk, &mut rng);
+        let payload_hash = payload.hash_payload();
+        let payload_hash_vec = vec![payload_hash];
+        let proof = protocol.sign(&payload_hash_vec, sk, &mut rng);
         Self { payload, proof }
     }
 }
@@ -299,19 +296,28 @@ pub fn remap_origin_ids(inputs: &Vec<Vec<Statement>>) -> Vec<Vec<Statement>> {
 
     let mut remapped_inputs = Vec::new();
 
-    for input in inputs {
+    println!("origin id map: {:?}", origin_id_map);
+
+    for (idx, input) in inputs.iter().enumerate() {
         let mut remapped_input = Vec::new();
-        for (idx, statement) in input.iter().enumerate() {
+        for statement in input {
             let mut remapped_statement = statement.clone();
+            println!("index: {:?}", idx);
+            println!("OLD statement: {:?}", remapped_statement);
             remapped_statement.left_origin.origin_id = GoldilocksField(
                 *origin_id_map
                     .get(&(idx, remapped_statement.left_origin.origin_id))
                     .unwrap(),
             );
-            if let Some(mut right_origin) = remapped_statement.right_origin {
-                right_origin.origin_id =
-                    GoldilocksField(*origin_id_map.get(&(idx, right_origin.origin_id)).unwrap());
+            if let Some(right_origin) = remapped_statement.right_origin {
+                remapped_statement.right_origin = Some(Origin {
+                    origin_id: GoldilocksField(
+                        *origin_id_map.get(&(idx, right_origin.origin_id)).unwrap(),
+                    ),
+                    gadget_id: right_origin.gadget_id,
+                });
             }
+            println!("NEW statement: {:?}", remapped_statement);
             remapped_input.push(remapped_statement);
         }
         remapped_inputs.push(remapped_input);
@@ -319,19 +325,38 @@ pub fn remap_origin_ids(inputs: &Vec<Vec<Statement>>) -> Vec<Vec<Statement>> {
     remapped_inputs
 }
 
-// TODO
+pub fn to_statements_with_remapping(inputs: &Vec<&SchnorrOrGODPOD>) -> Vec<Statement> {
+    let statements = inputs
+        .iter()
+        .map(|pod| match pod {
+            SchnorrOrGODPOD::GODPOD(p) => p.clone().payload,
+            SchnorrOrGODPOD::SchnorrPOD(p) => p
+                .payload
+                .iter()
+                .map(|entry| entry_to_statement(entry, GadgetID::SCHNORR16))
+                .collect::<Vec<Statement>>(),
+        })
+        .collect::<Vec<Vec<Statement>>>();
+
+    // Now remap
+    remap_origin_ids(&statements).concat()
+}
+
 impl GODPOD {
     pub fn new(statements: &Vec<Statement>) -> Self {
         let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
         let protocol = SchnorrSigner::new();
         let payload = statements.clone();
-        let payload_vec = statements.to_field_vec();
-        let proof = protocol.sign(&payload_vec, &SchnorrSecretKey { sk: 0 }, &mut rng);
+        let payload_hash = statements.hash_payload();
+        let payload_hash_vec = vec![payload_hash];
+
+        // signature is a hardcoded skey (currently 0)
+        let proof = protocol.sign(&payload_hash_vec, &SchnorrSecretKey { sk: 0 }, &mut rng);
         Self { payload, proof }
     }
 
-    pub fn from_pods(
-        inputs: &Vec<SchnorrOrGODPOD>, // will be converted to a vector of statements
+    pub fn gadget(
+        inputs: &Vec<&SchnorrOrGODPOD>, // will be converted to a vector of statements
         operations: &Vec<(
             Operation,
             Option<usize>,
@@ -339,22 +364,20 @@ impl GODPOD {
             Option<&Entry<ScalarOrVec>>,
         )>,
     ) -> Self {
-        // Check signatures.
+        // Check all input pods are valid.
+        for pod in inputs {
+            match pod {
+                SchnorrOrGODPOD::GODPOD(p) => {
+                    assert!(p.verify().expect("input GODPOD verification failed"));
+                }
+                SchnorrOrGODPOD::SchnorrPOD(p) => {
+                    assert!(p.verify().expect("input SchnorrPOD verification failed"));
+                }
+            }
+        }
         // Compile/arrange list of statements as Vec<Statement> (after converting each `Entry` into a `ValueOf` statement).
-        let statements = inputs
-            .iter()
-            .map(|pod| match pod {
-                SchnorrOrGODPOD::GODPOD(p) => p.clone().payload,
-                SchnorrOrGODPOD::SchnorrPOD(p) => p
-                    .payload
-                    .iter()
-                    .map(|entry| entry_to_statement(entry, GadgetID::GOD))
-                    .collect::<Vec<Statement>>(),
-            })
-            .collect::<Vec<Vec<Statement>>>();
-
-        // Now remap
-        let remapped_statements = remap_origin_ids(&statements).concat();
+        // and then remap
+        let remapped_statements = to_statements_with_remapping(inputs);
 
         // apply operations one by one on remapped_statements
         let mut final_statements = Vec::new();
@@ -398,6 +421,7 @@ pub enum Operation {
     GtFromEntries = 5,
     TransitiveEqualityFromStatements = 6,
     GtToNonequality = 7,
+    Contains = 8,
 }
 
 impl Operation {
@@ -438,7 +462,7 @@ impl Operation {
                         if left_entry.optional_value != right_entry.optional_value =>
                     {
                         Some(Statement {
-                            predicate: StatementPredicate::Equal,
+                            predicate: StatementPredicate::NotEqual,
                             left_origin: left_entry.left_origin,
                             left_key_name: left_entry.left_key_name.clone(),
                             right_origin: Some(right_entry.left_origin),
@@ -538,6 +562,8 @@ impl Operation {
                 }),
                 _ => None,
             },
+            // TODO. also first need to make it so statement values can be vectors
+            (Self::Contains, _, _, _) => None,
             _ => None,
         }
     }
@@ -702,18 +728,26 @@ fn op_test() -> Result<(), Error> {
         ) == Some(expected_statement)
     );
 
+    Ok(())
+}
+
+#[test]
+fn schnorr_pod_test() -> Result<(), Error> {
+    // Start with some values.
+    let scalar1 = GoldilocksField(36);
+    let scalar2 = GoldilocksField(52);
+    let vector_value = vec![scalar1, scalar2];
+
     let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
     let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
     let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
 
-    println!("=================TEST POD SCHNORR=================");
-
-    let schnorrPOD1 = SchnorrPOD::new(
+    let schnorrPOD1 = SchnorrPOD::gadget(
         &vec![entry1.clone(), entry2.clone()],
         &SchnorrSecretKey { sk: 25 },
     );
 
-    let schnorrPOD2 = SchnorrPOD::new(
+    let schnorrPOD2 = SchnorrPOD::gadget(
         &vec![entry2.clone(), entry3.clone()],
         &SchnorrSecretKey { sk: 42 },
     );
@@ -728,4 +762,141 @@ fn op_test() -> Result<(), Error> {
     assert!(schnorrPOD2.verify()? == true);
 
     Ok(())
+}
+
+#[test]
+fn god_pod_from_schnorr_test() -> Result<(), Error> {
+    // Start with some values.
+    let scalar1 = GoldilocksField(36);
+    let scalar2 = GoldilocksField(52);
+    let scalar3 = GoldilocksField(90);
+    let vector_value = vec![scalar1, scalar2];
+
+    // make entries
+    let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
+    let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
+    let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
+    let entry4 = Entry::new("new key", ScalarOrVec::Scalar(scalar2));
+    let entry5 = Entry::new("foo", ScalarOrVec::Scalar(GoldilocksField(100)));
+    let entry6 = Entry::new("baz", ScalarOrVec::Scalar(GoldilocksField(120)));
+    let entry7 = Entry::new("yum", ScalarOrVec::Scalar(scalar2));
+    let entry9 = Entry::new("godpod introduced entry key", ScalarOrVec::Scalar(scalar3));
+
+    // three schnorr pods
+    let schnorrPOD1 = SchnorrPOD::gadget(
+        &vec![entry1.clone(), entry2.clone()],
+        &SchnorrSecretKey { sk: 25 },
+    );
+
+    let schnorrPOD2 = SchnorrPOD::gadget(
+        &vec![entry3.clone(), entry4.clone()],
+        &SchnorrSecretKey { sk: 42 },
+    );
+
+    let schnorrPOD3 = SchnorrPOD::gadget(
+        &vec![entry5.clone(), entry6.clone(), entry7.clone()],
+        &SchnorrSecretKey { sk: 83 },
+    );
+
+    // make a GODPOD using from_pods called on the two schnorr PODs
+    let god_pod_1 = GODPOD::gadget(
+        &vec![
+            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD1.clone()),
+            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD2.clone()),
+            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
+        ],
+        &vec![
+            (Operation::CopyStatement, Some(0), None, None),
+            (Operation::CopyStatement, Some(1), None, None),
+            (Operation::CopyStatement, Some(2), None, None),
+            (Operation::CopyStatement, Some(3), None, None),
+            (Operation::CopyStatement, Some(4), None, None),
+            (Operation::CopyStatement, Some(5), None, None),
+            (Operation::NewEntry, None, None, Some(&entry9)),
+            (Operation::EqualityFromEntries, Some(1), Some(4), None),
+            (Operation::EqualityFromEntries, Some(4), Some(8), None),
+            (Operation::NonequalityFromEntries, Some(0), Some(1), None),
+            (Operation::GtFromEntries, Some(1), Some(0), None),
+        ],
+    );
+    println!("GODPOD1: {:?}", god_pod_1);
+    assert!(god_pod_1.verify()? == true);
+
+    // another GODPOD from the first GODPOD and another schnorr POD
+
+    let god_pod_2 = GODPOD::gadget(
+        &vec![
+            &SchnorrOrGODPOD::GODPOD(god_pod_1.clone()),
+            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
+        ],
+        &vec![
+            (Operation::CopyStatement, Some(8), None, None),
+            (Operation::CopyStatement, Some(9), None, None),
+            (Operation::CopyStatement, Some(3), None, None),
+            (Operation::GtFromEntries, Some(6), Some(0), None),
+            (
+                Operation::TransitiveEqualityFromStatements,
+                Some(7),
+                Some(8),
+                None,
+            ),
+            (Operation::GtToNonequality, Some(10), None, None),
+        ],
+    );
+    println!("GODPOD2: {:?}", god_pod_2);
+
+    // println!(
+    //     "verify schnorrpod1: {:?}",
+    //     schnorrPOD1.clone().payload.to_field_vec()
+    // );
+    // println!("verify schnorrpod2: {:?}", schnorrPOD2.verify());
+
+    assert!(god_pod_2.verify()? == true);
+
+    Ok(())
+}
+
+#[test]
+#[should_panic]
+fn god_pod_should_panic() {
+    // Start with some values.
+    let scalar1 = GoldilocksField(36);
+    let scalar2 = GoldilocksField(52);
+    let scalar3 = GoldilocksField(90);
+    let vector_value = vec![scalar1, scalar2];
+
+    // make entries
+    let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
+    let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
+    let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
+    let entry4 = Entry::new("new key", ScalarOrVec::Scalar(scalar2));
+    let entry5 = Entry::new("foo", ScalarOrVec::Scalar(GoldilocksField(100)));
+    let entry6 = Entry::new("foo", ScalarOrVec::Scalar(GoldilocksField(120)));
+    let entry9 = Entry::new("godpod introduced entry key", ScalarOrVec::Scalar(scalar3));
+
+    // three schnorr pods
+    let schnorrPOD1 = SchnorrPOD::gadget(
+        &vec![entry1.clone(), entry2.clone()],
+        &SchnorrSecretKey { sk: 25 },
+    );
+
+    let schnorrPOD2 = SchnorrPOD::gadget(
+        &vec![entry3.clone(), entry4.clone()],
+        &SchnorrSecretKey { sk: 42 },
+    );
+
+    let schnorrPOD3 = SchnorrPOD::gadget(
+        &vec![entry5.clone(), entry6.clone()],
+        &SchnorrSecretKey { sk: 83 },
+    );
+
+    // make a GODPOD using from_pods called on the two schnorr PODs
+    let god_pod_1 = GODPOD::gadget(
+        &vec![
+            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD1.clone()),
+            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD2.clone()),
+        ],
+        // this Gt operation should fail because 36 is not gt 52
+        &vec![(Operation::GtFromEntries, Some(0), Some(1), None)],
+    );
 }
