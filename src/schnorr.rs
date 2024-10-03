@@ -97,6 +97,7 @@ impl SchnorrSigner {
         let k: u64 = self.rand_group_multiplier(rng);
         let r: GoldilocksField = Self::pow(self.PRIME_GROUP_GEN, k);
         let e: u64 = self.hash_insecure(&r, msg);
+        println!("[SIGN] msg is: {:?}", msg);
         assert!(k < self.PRIME_GROUP_ORDER);
         assert!(sk.sk < self.PRIME_GROUP_ORDER);
         assert!(e < self.PRIME_GROUP_ORDER);
@@ -114,6 +115,7 @@ impl SchnorrSigner {
     ) -> bool {
         let r: GoldilocksField = Self::pow(self.PRIME_GROUP_GEN, sig.s) * Self::pow(pk.pk, sig.e);
         let e_v: u64 = self.hash_insecure(&r, msg);
+        println!("[VERIFY] msg is: {:?}", msg);
         e_v == sig.e
     }
 }
@@ -139,6 +141,32 @@ mod tests {
         let pk: SchnorrPublicKey = ss.keygen(&sk);
 
         let msg0_u64: Vec<u64> = vec![17, 123985, 3, 12];
+        let msg0: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(msg0_u64);
+        let sig: SchnorrSignature = ss.sign(&msg0, &sk, &mut rng);
+        let res: bool = ss.verify(&sig, &msg0, &pk);
+        println!("Trying to verify:");
+        println!("Secret key: {:?}", sk);
+        println!("Public key: {:?}", pk);
+        println!("Signature: {:?}", sig);
+        assert!(res);
+    }
+
+    #[test]
+    fn test_sig_2() {
+        println!("=================TEST SIG 2=================");
+        let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
+        let ss = SchnorrSigner::new();
+        let sk: SchnorrSecretKey = SchnorrSecretKey { sk: 25 };
+        let pk: SchnorrPublicKey = ss.keygen(&sk);
+
+        let msg0_u64: Vec<u64> = vec![
+            8066043497359175718,
+            9159038346762061233,
+            1329333430040973227,
+            36,
+            16682101190217481272,
+            52,
+        ];
         let msg0: Vec<GoldilocksField> = ss.u64_into_goldilocks_vec(msg0_u64);
         let sig: SchnorrSignature = ss.sign(&msg0, &sk, &mut rng);
         let res: bool = ss.verify(&sig, &msg0, &pk);

@@ -258,7 +258,7 @@ impl SchnorrPOD {
             "_signer",
             ScalarOrVec::Scalar(protocol.keygen(sk).pk),
         ));
-        let payload_vec = entries.to_field_vec();
+        let payload_vec = payload.to_field_vec();
         let proof = protocol.sign(&payload_vec, sk, &mut rng);
         Self { payload, proof }
     }
@@ -544,7 +544,7 @@ impl Operation {
 }
 
 #[test]
-fn op_test() {
+fn op_test() -> Result<(), Error> {
     // Start with some values.
     let scalar1 = GoldilocksField(36);
     let scalar2 = GoldilocksField(52);
@@ -553,7 +553,7 @@ fn op_test() {
     // Create entries
     let entry1 = Entry::new("some key", scalar1);
     let entry2 = Entry::new("some other key", scalar2);
-    let entry3 = Entry::new("vector entry", vector_value);
+    let entry3 = Entry::new("vector entry", vector_value.clone());
     let entry4 = Entry::new("another scalar1", scalar1);
     let entry5 = Entry::new("yet another scalar1", scalar1);
 
@@ -701,4 +701,31 @@ fn op_test() {
             None
         ) == Some(expected_statement)
     );
+
+    let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
+    let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
+    let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
+
+    println!("=================TEST POD SCHNORR=================");
+
+    let schnorrPOD1 = SchnorrPOD::new(
+        &vec![entry1.clone(), entry2.clone()],
+        &SchnorrSecretKey { sk: 25 },
+    );
+
+    let schnorrPOD2 = SchnorrPOD::new(
+        &vec![entry2.clone(), entry3.clone()],
+        &SchnorrSecretKey { sk: 42 },
+    );
+
+    // println!(
+    //     "verify schnorrpod1: {:?}",
+    //     schnorrPOD1.clone().payload.to_field_vec()
+    // );
+    // println!("verify schnorrpod2: {:?}", schnorrPOD2.verify());
+
+    assert!(schnorrPOD1.verify()? == true);
+    assert!(schnorrPOD2.verify()? == true);
+
+    Ok(())
 }
