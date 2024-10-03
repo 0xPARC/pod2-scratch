@@ -351,6 +351,10 @@ impl GODPOD {
         let payload_hash_vec = vec![payload_hash];
 
         // signature is a hardcoded skey (currently 0)
+        // todo is to build a limited version of this with a ZKP
+        // would start by making it so that the ZKP only allows
+        // a max number of input PODs, max number of entries/statements per input POD,
+        // max number of statements for output POD, and some max number of each type of operation
         let proof = protocol.sign(&payload_hash_vec, &SchnorrSecretKey { sk: 0 }, &mut rng);
         Self { payload, proof }
     }
