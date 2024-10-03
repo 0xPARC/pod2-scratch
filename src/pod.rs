@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
 use plonky2::field::types::PrimeField64;
@@ -49,20 +52,11 @@ impl HashablePayload for Vec<Statement> {
                     vec![
                         GoldilocksField(statement.predicate as u64),
                         statement.left_origin.origin_id,
-                        GoldilocksField(match statement.left_origin.gadget_id {
-                            Some(x) => x as usize as u64,
-                            _ => 0,
-                        }),
+                        GoldilocksField(statement.left_origin.gadget_id as u64),
                         hash_string_to_field(&statement.left_key_name),
                     ],
                     match statement.right_origin {
-                        Some(ro) => vec![
-                            ro.origin_id,
-                            GoldilocksField(match ro.gadget_id {
-                                Some(gid) => gid as usize as u64,
-                                _ => 0,
-                            }),
-                        ],
+                        Some(ro) => vec![ro.origin_id, GoldilocksField(ro.gadget_id as u64)],
                         _ => vec![GoldilocksField(0), GoldilocksField(0)],
                     },
                     vec![
@@ -172,8 +166,8 @@ pub enum GadgetID {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Origin {
-    pub origin_id: GoldilocksField,  // reserve 0 for NONE, 1 for SELF
-    pub gadget_id: Option<GadgetID>, // if origin_id is SELF, this is none; otherwise, it's the gadget_id
+    pub origin_id: GoldilocksField, // reserve 0 for NONE, 1 for SELF
+    pub gadget_id: GadgetID, // if origin_id is SELF, this is none; otherwise, it's the gadget_id
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -216,6 +210,20 @@ pub struct Statement {
     pub optional_value: Option<GoldilocksField>,
 }
 
+pub fn entry_to_statement<V: EntryValue>(entry: &Entry<V>, gadget_id: GadgetID) -> Statement {
+    Statement {
+        predicate: StatementPredicate::ValueOf,
+        left_origin: Origin {
+            origin_id: GoldilocksField(1),
+            gadget_id,
+        },
+        left_key_name: entry.key_name.clone(),
+        right_origin: None,
+        right_key_name: None,
+        optional_value: Some(entry.value.hash_or_value()),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct POD<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usize> {
     pub payload: Payload,
@@ -256,37 +264,129 @@ impl SchnorrPOD {
     }
 }
 
-// TODO
-impl GODPOD {
-    pub fn new(statements: &Vec<Statement>, sk: &SchnorrSecretKey) -> Self {
-        let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
-        let protocol = SchnorrSigner::new();
-
-        let mut payload = statements.clone();
-        payload.push(
-            Statement {
-                predicate: StatementPredicate::ValueOf,
-                left_origin: Origin {origin_id: GoldilocksField(1), gadget_id: None },
-                left_key_name: "_signer".to_string(),
-                right_origin: None,
-                right_key_name: None,
-                optional_value: Some(protocol.keygen(sk).pk)
+pub fn remap_origin_ids(inputs: &Vec<Vec<Statement>>) -> Vec<Vec<Statement>> {
+    let mut all_in_origin_ids = Vec::new();
+    for i in 0..inputs.len() {
+        for statement in inputs[i].iter() {
+            let left_origin_tuple = (i, statement.left_origin.origin_id);
+            if !all_in_origin_ids.contains(&left_origin_tuple) {
+                all_in_origin_ids.push(left_origin_tuple);
             }
-        );
-        let payload_vec = statements.to_field_vec();
-        let proof = protocol.sign(&payload_vec, sk, &mut rng);
-        Self { payload, proof }
+
+            if let Some(right_origin) = statement.right_origin {
+                let right_origin_tuple = (i, right_origin.origin_id);
+                if !all_in_origin_ids.contains(&right_origin_tuple) {
+                    all_in_origin_ids.push(right_origin_tuple);
+                }
+            }
+        }
     }
+
+    // sort all_in_origin_ids in place
+    all_in_origin_ids.sort_by(|a, b| {
+        let first_cmp = a.0.cmp(&b.0);
+        if first_cmp == Ordering::Equal {
+            (a.1).to_canonical_u64().cmp(&(b.1).to_canonical_u64())
+        } else {
+            first_cmp
+        }
+    });
+
+    let mut origin_id_map = HashMap::new();
+    for idx_and_origin_id in all_in_origin_ids.iter().enumerate() {
+        origin_id_map.insert(idx_and_origin_id.1, (idx_and_origin_id.0 + 2) as u64);
+    }
+
+    let mut remapped_inputs = Vec::new();
+
+    for input in inputs {
+        let mut remapped_input = Vec::new();
+        for (idx, statement) in input.iter().enumerate() {
+            let mut remapped_statement = statement.clone();
+            remapped_statement.left_origin.origin_id = GoldilocksField(
+                *origin_id_map
+                    .get(&(idx, remapped_statement.left_origin.origin_id))
+                    .unwrap(),
+            );
+            if let Some(mut right_origin) = remapped_statement.right_origin {
+                right_origin.origin_id =
+                    GoldilocksField(*origin_id_map.get(&(idx, right_origin.origin_id)).unwrap());
+            }
+            remapped_input.push(remapped_statement);
+        }
+        remapped_inputs.push(remapped_input);
+    }
+    remapped_inputs
 }
 
-// impl GODPOD {
-//     // TODO
-//     pub fn from_pods(inputs: &Vec<SchnorrOrGODPOD>, operations: &Vec<Operation>) -> Self {
-//         // Check signatures.
-//         // Compile/arrange list of statements as Vec<Statement> (after converting each `Entry` into a `ValueOf` statement).
-//         // Construct GODPOD.
-//     }
-// }
+// TODO
+impl GODPOD {
+    pub fn new(statements: &Vec<Statement>) -> Self {
+        let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
+        let protocol = SchnorrSigner::new();
+        let payload = statements.clone();
+        let payload_vec = statements.to_field_vec();
+        let proof = protocol.sign(&payload_vec, &SchnorrSecretKey { sk: 0 }, &mut rng);
+        Self { payload, proof }
+    }
+
+    pub fn from_pods(
+        inputs: &Vec<SchnorrOrGODPOD>, // will be converted to a vector of statements
+        operations: &Vec<(
+            Operation,
+            Option<usize>,
+            Option<usize>,
+            Option<&Entry<ScalarOrVec>>,
+        )>,
+    ) -> Self {
+        // Check signatures.
+        // Compile/arrange list of statements as Vec<Statement> (after converting each `Entry` into a `ValueOf` statement).
+        let statements = inputs
+            .iter()
+            .map(|pod| match pod {
+                SchnorrOrGODPOD::GODPOD(p) => p.clone().payload,
+                SchnorrOrGODPOD::SchnorrPOD(p) => p
+                    .payload
+                    .iter()
+                    .map(|entry| entry_to_statement(entry, GadgetID::GOD))
+                    .collect::<Vec<Statement>>(),
+            })
+            .collect::<Vec<Vec<Statement>>>();
+
+        // Now remap
+        let remapped_statements = remap_origin_ids(&statements).concat();
+
+        // apply operations one by one on remapped_statements
+        let mut final_statements = Vec::new();
+        for (operation, left_idx, right_idx, entry) in operations {
+            let left_statement = match left_idx {
+                Some(idx) => Some(&remapped_statements[*idx]),
+                None => None,
+            };
+            let right_statement = match right_idx {
+                Some(idx) => Some(&remapped_statements[*idx]),
+                None => None,
+            };
+            let optional_entry = match entry {
+                Some(entry) => Some(entry.clone()),
+                None => None,
+            };
+            final_statements.push(operation.apply_operation(
+                GadgetID::GOD,
+                left_statement,
+                right_statement,
+                optional_entry,
+            ))
+        }
+
+        GODPOD::new(
+            &final_statements
+                .iter()
+                .map(|maybe_statement| maybe_statement.clone().unwrap())
+                .collect::<Vec<Statement>>(),
+        )
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub enum Operation {
@@ -302,24 +402,15 @@ pub enum Operation {
 
 impl Operation {
     pub fn apply_operation<V: EntryValue>(
-        self,
+        &self,
+        gadget_id: GadgetID,
         left_statement: Option<&Statement>,
         right_statement: Option<&Statement>,
         optional_entry: Option<&Entry<V>>,
     ) -> Option<Statement> {
         match (self, left_statement, right_statement, optional_entry) {
-            // A new entry is created from a single `Entry`.
-            (Self::NewEntry, _, _, Some(entry)) => Some(Statement {
-                predicate: StatementPredicate::ValueOf,
-                left_origin: Origin {
-                    origin_id: GoldilocksField(1),
-                    gadget_id: None,
-                },
-                left_key_name: entry.key_name.clone(),
-                right_origin: None,
-                right_key_name: None,
-                optional_value: Some(entry.value.hash_or_value()),
-            }),
+            // A new statement is created from a single `Entry`.
+            (Self::NewEntry, _, _, Some(entry)) => Some(entry_to_statement(&entry, gadget_id)),
             // A statement is copied from a single (left) statement.
             (Self::CopyStatement, Some(statement), _, _) => Some(statement.clone()),
             // Eq <=> Left entry = right entry
@@ -468,19 +559,19 @@ fn op_test() {
 
     // Create entry statements. Unwrapped for convenience.
     let entry_statement1 = Operation::NewEntry
-        .apply_operation(None, None, Some(&entry1))
+        .apply_operation(GadgetID::GOD, None, None, Some(&entry1))
         .unwrap();
     let entry_statement2 = Operation::NewEntry
-        .apply_operation(None, None, Some(&entry2))
+        .apply_operation(GadgetID::GOD, None, None, Some(&entry2))
         .unwrap();
     let entry_statement3 = Operation::NewEntry
-        .apply_operation(None, None, Some(&entry3))
+        .apply_operation(GadgetID::GOD, None, None, Some(&entry3))
         .unwrap();
     let entry_statement4 = Operation::NewEntry
-        .apply_operation(None, None, Some(&entry4))
+        .apply_operation(GadgetID::GOD, None, None, Some(&entry4))
         .unwrap();
     let entry_statement5 = Operation::NewEntry
-        .apply_operation(None, None, Some(&entry5))
+        .apply_operation(GadgetID::GOD, None, None, Some(&entry5))
         .unwrap();
 
     let entries = [&entry_statement1, &entry_statement2, &entry_statement3];
@@ -488,7 +579,7 @@ fn op_test() {
     // Copy statements and check for equality of entries.
     entries.into_iter().for_each(|statement| {
         let copy = Operation::CopyStatement
-            .apply_operation::<GoldilocksField>(Some(statement), None, None)
+            .apply_operation::<GoldilocksField>(GadgetID::GOD, Some(statement), None, None)
             .expect("This value should exist.");
         assert!(&copy == statement);
     });
@@ -497,6 +588,7 @@ fn op_test() {
     println!(
         "{:?}",
         Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
+            GadgetID::GOD,
             Some(&entry_statement1),
             Some(&entry_statement2),
             None
@@ -505,6 +597,7 @@ fn op_test() {
     entries.into_iter().for_each(|statement| {
         assert!(
             Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
+                GadgetID::GOD,
                 Some(statement),
                 Some(statement),
                 None
@@ -520,6 +613,7 @@ fn op_test() {
     });
     assert!(
         Operation::NonequalityFromEntries.apply_operation::<GoldilocksField>(
+            GadgetID::GOD,
             Some(&entry_statement1),
             Some(&entry_statement2),
             None
@@ -534,6 +628,7 @@ fn op_test() {
     );
     assert!(
         Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
+            GadgetID::GOD,
             Some(&entry_statement1),
             Some(&entry_statement2),
             None
@@ -542,6 +637,7 @@ fn op_test() {
 
     // Gt check
     let gt_statement = Operation::GtFromEntries.apply_operation::<GoldilocksField>(
+        GadgetID::GOD,
         Some(&entry_statement2),
         Some(&entry_statement1),
         None,
@@ -560,17 +656,33 @@ fn op_test() {
 
     // Eq transitivity check
     let eq_statement1 = Operation::EqualityFromEntries
-        .apply_operation::<GoldilocksField>(Some(&entry_statement4), Some(&entry_statement1), None)
+        .apply_operation::<GoldilocksField>(
+            GadgetID::GOD,
+            Some(&entry_statement4),
+            Some(&entry_statement1),
+            None,
+        )
         .unwrap();
     let eq_statement2 = Operation::EqualityFromEntries
-        .apply_operation::<GoldilocksField>(Some(&entry_statement1), Some(&entry_statement5), None)
+        .apply_operation::<GoldilocksField>(
+            GadgetID::GOD,
+            Some(&entry_statement1),
+            Some(&entry_statement5),
+            None,
+        )
         .unwrap();
     let eq_statement3 = Operation::EqualityFromEntries
-        .apply_operation::<GoldilocksField>(Some(&entry_statement4), Some(&entry_statement5), None)
+        .apply_operation::<GoldilocksField>(
+            GadgetID::GOD,
+            Some(&entry_statement4),
+            Some(&entry_statement5),
+            None,
+        )
         .unwrap();
 
     assert!(
         Operation::TransitiveEqualityFromStatements.apply_operation::<GoldilocksField>(
+            GadgetID::GOD,
             Some(&eq_statement1),
             Some(&eq_statement2),
             None
@@ -583,6 +695,7 @@ fn op_test() {
     expected_statement.predicate = StatementPredicate::NotEqual;
     assert!(
         Operation::GtToNonequality.apply_operation::<GoldilocksField>(
+            GadgetID::GOD,
             Some(&unwrapped_gt_statement),
             None,
             None
