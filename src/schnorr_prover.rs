@@ -22,11 +22,11 @@ type GoldF = GoldilocksField;
 // This is intended solely as a proof of concept.
 
 pub struct MessageTarget {
-    msg: Vec<Target>,
+    pub msg: Vec<Target>,
 }
 
 impl MessageTarget {
-    fn new_with_size(builder: &mut CircuitBuilder<GoldF, 2>, n: usize) -> Self {
+    pub fn new_with_size(builder: &mut CircuitBuilder<GoldF, 2>, n: usize) -> Self {
         Self {
             msg: builder.add_virtual_targets(n),
         }
@@ -48,13 +48,17 @@ pub struct SchnorrSignatureTarget {
 }
 
 impl SchnorrSignatureTarget {
-    fn new_virtual(builder: &mut CircuitBuilder<GoldF, 2>) -> Self {
+    pub fn new_virtual(builder: &mut CircuitBuilder<GoldF, 2>) -> Self {
         let s = builder.add_virtual_target();
         let e = builder.add_virtual_target();
         Self { s, e }
     }
 
-    fn set_witness(&self, pw: &mut PartialWitness<GoldF>, sig: &SchnorrSignature) -> Result<()> {
+    pub fn set_witness(
+        &self,
+        pw: &mut PartialWitness<GoldF>,
+        sig: &SchnorrSignature,
+    ) -> Result<()> {
         pw.set_target(self.s, GoldilocksField::from_canonical_u64(sig.s))?;
         pw.set_target(self.e, GoldilocksField::from_canonical_u64(sig.e))?;
         Ok(())
@@ -62,11 +66,11 @@ impl SchnorrSignatureTarget {
 }
 
 pub struct SchnorrPublicKeyTarget {
-    pk: Target,
+    pub pk: Target,
 }
 
 impl SchnorrPublicKeyTarget {
-    fn new_virtual(builder: &mut CircuitBuilder<GoldF, 2>) -> Self {
+    pub fn new_virtual(builder: &mut CircuitBuilder<GoldF, 2>) -> Self {
         Self {
             pk: builder.add_virtual_target(),
         }
