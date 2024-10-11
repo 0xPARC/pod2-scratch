@@ -53,8 +53,8 @@ impl SchnorrSigner {
         let mut a_copy = a;
         let mut res = GoldilocksField(1);
         let mut x_pow_2n = x.clone();
-        while (a_copy > 0) {
-            if (a_copy % 2 != 0) {
+        while a_copy > 0 {
+            if a_copy % 2 != 0 {
                 res *= x_pow_2n;
             }
             a_copy /= 2;
@@ -101,7 +101,7 @@ impl SchnorrSigner {
         assert!(k < self.PRIME_GROUP_ORDER);
         assert!(sk.sk < self.PRIME_GROUP_ORDER);
         assert!(e < self.PRIME_GROUP_ORDER);
-        let mut s128: u128 = ((k as u128) + (sk.sk as u128) * (e as u128));
+        let mut s128: u128 = (k as u128) + (sk.sk as u128) * (e as u128);
         s128 %= self.PRIME_GROUP_ORDER as u128;
         let s: u64 = s128 as u64;
         SchnorrSignature { e, s }
