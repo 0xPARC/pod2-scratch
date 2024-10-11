@@ -233,6 +233,12 @@ pub fn entry_to_statement<V: EntryValue>(entry: &Entry<V>, gadget_id: GadgetID) 
     }
 }
 
+impl<V: EntryValue> Into<Statement> for Entry<V> {
+    fn into(self) -> Statement {
+        entry_to_statement(&self, GadgetID::NONE)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct POD<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usize> {
     pub payload: Payload,
@@ -653,25 +659,13 @@ fn op_test() -> Result<(), Error> {
     let entry5 = Entry::new("yet another scalar1", scalar1);
     let entry6 = Entry::new("scalar3", scalar3);
 
-    // Create entry statements. Unwrapped for convenience.
-    let entry_statement1 = Operation::NewEntry
-        .apply_operation(GadgetID::GOD, None, None, None, Some(&entry1))
-        .unwrap();
-    let entry_statement2 = Operation::NewEntry
-        .apply_operation(GadgetID::GOD, None, None, None, Some(&entry2))
-        .unwrap();
-    let entry_statement3 = Operation::NewEntry
-        .apply_operation(GadgetID::GOD, None, None, None, Some(&entry3))
-        .unwrap();
-    let entry_statement4 = Operation::NewEntry
-        .apply_operation(GadgetID::GOD, None, None, None, Some(&entry4))
-        .unwrap();
-    let entry_statement5 = Operation::NewEntry
-        .apply_operation(GadgetID::GOD, None, None, None, Some(&entry5))
-        .unwrap();
-    let entry_statement6 = Operation::NewEntry
-        .apply_operation(GadgetID::GOD, None, None, None, Some(&entry6))
-        .unwrap();
+    // Create entry statements.
+    let entry_statement1 = entry1.into();
+    let entry_statement2 = entry2.into();
+    let entry_statement3 = entry3.into();
+    let entry_statement4 = entry4.into();
+    let entry_statement5 = entry5.into();
+    let entry_statement6 = entry6.into();
 
     // Entry 2's value = entry 1's value + entry 6's value
     let sum_of_statement = Operation::SumOf
