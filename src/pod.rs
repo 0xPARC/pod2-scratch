@@ -580,7 +580,11 @@ impl OperationCmd {
                 return Some(Statement::from_entry(&entry, gadget_id));
             }
             // A statement is copied from a single (left) statement.
-            (OperationType::CopyStatement, Some(statement), _, _, _) => Some(statement.clone()),
+            (OperationType::CopyStatement, Some(statement), _, _, _) => {
+                let mut cloned = statement.clone();
+                cloned.name = self.output_statement_name.clone();
+                return Some(cloned);
+            }
             // Eq <=> Left entry = right entry
             (OperationType::EqualityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
                 match (left_entry.predicate, right_entry.predicate) {
