@@ -3,6 +3,7 @@ use std::collections::HashMap;
 //use circuit::pod2_circuit;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
+use plonky2::field::types::PrimeField64;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::GenericHashOut;
 use plonky2::plonk::config::Hasher;
@@ -144,7 +145,7 @@ pub struct PODPayload {
 }
 
 impl PODPayload {
-    pub fn new(statements: HashMap<String, Statement>) -> Self {
+    pub fn new(statements: &HashMap<String, Statement>) -> Self {
         let mut statements_list = Vec::new();
         for (_, statement) in statements.iter() {
             statements_list.push(statement.clone());
@@ -292,7 +293,7 @@ impl POD {
             );
         }
 
-        let payload = PODPayload::new(statement_map);
+        let payload = PODPayload::new(&statement_map);
         let payload_hash = payload.hash_payload();
         let payload_hash_vec = vec![payload_hash];
         let proof = protocol.sign(&payload_hash_vec, sk, &mut rng);
@@ -428,59 +429,26 @@ impl POD {
         Ok(statements_with_renamed_origins)
     }
 
-    fn get_statement_with_origin_and_name(
-        statements: &HashMap<String, HashMap<String, Statement>>,
-        self_statements: &HashMap<String, Statement>,
-        origin: Option<String>,
-        name: Option<String>,
-    ) -> Option<Statement> {
-        if let Some(origin) = origin {
-            if let Some(name) = name {
-                if origin == "_SELF" {
-                    return self_statements.get(&name).cloned();
-                }
-                if let Some(map) = statements.get(&origin) {
-                    if let Some(statement) = map.get(&name) {
-                        return Some(statement.clone());
-                    }
-                }
-            }
-        }
-        None
-    }
-
     pub fn execute_oracle_gadget(input: GPGInput, cmds: &Vec<OperationCmd>) -> Result<Self, Error> {
-        let statements = POD::remap_origin_ids_by_name(input);
-        match &statements {
+        let mut statements = POD::remap_origin_ids_by_name(input);
+        match &mut statements {
             Ok(statements) => {
-                let mut out_statements = HashMap::new();
+                statements.insert("_SELF".to_string(), HashMap::new());
                 for cmd in cmds {
-                    let statement1 = POD::get_statement_with_origin_and_name(
-                        statements,
-                        &out_statements,
-                        cmd.statement_1_name.clone(),
-                        cmd.statement_1_origin.clone(),
-                    );
-                    let statement2 = POD::get_statement_with_origin_and_name(
-                        &statements,
-                        &out_statements,
-                        cmd.statement_2_name.clone(),
-                        cmd.statement_2_origin.clone(),
-                    );
-                    let statement3 = POD::get_statement_with_origin_and_name(
-                        &statements,
-                        &out_statements,
-                        cmd.statement_3_name.clone(),
-                        cmd.statement_3_origin.clone(),
-                    );
-                    let new_statement = cmd.execute(GadgetID::ORACLE, statements, &out_statements);
+                    let new_statement = cmd.execute(GadgetID::ORACLE, statements);
                     match new_statement {
-                        Ok(new_statement) => {
-                            out_statements.insert(cmd.output_statement_name.clone(), new_statement);
+                        Some(new_statement) => {
+                            statements
+                                .get_mut("_SELF")
+                                .unwrap()
+                                .insert(cmd.output_statement_name.clone(), new_statement);
                         }
-                        Err(e) => return Err(e),
+                        None => {
+                            return Err("operation failed to execute".into());
+                        }
                     }
                 }
+                let out_statements = statements.get("_SELF").unwrap();
                 let out_payload = PODPayload::new(out_statements);
                 let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
                 let protocol = SchnorrSigner::new();
@@ -499,87 +467,8 @@ impl POD {
                     proof_type: GadgetID::ORACLE,
                 })
             }
-            Err(e) => Err(*e),
+            Err(e) => panic!("Error: {:?}", e),
         }
-    }
-}
-
-impl GODPOD {
-    pub fn new(statements: &Vec<Statement>) -> Self {
-        let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
-        let protocol = SchnorrSigner::new();
-        let payload = statements.clone();
-        let payload_hash = statements.hash_payload();
-        let payload_hash_vec = vec![payload_hash];
-
-        // signature is a hardcoded skey (currently 0)
-        // todo is to build a limited version of this with a ZKP
-        // would start by making it so that the ZKP only allows
-        // a max number of input PODs, max number of entries/statements per input POD,
-        // max number of statements for output POD, and some max number of each type of operation
-        let proof = protocol.sign(&payload_hash_vec, &SchnorrSecretKey { sk: 0 }, &mut rng);
-        Self { payload, proof }
-    }
-
-    pub fn gadget(
-        inputs: &Vec<&SchnorrOrGODPOD>, // will be converted to a vector of statements
-        operations: &Vec<(
-            OperationType,
-            Option<usize>,
-            Option<usize>,
-            Option<usize>,
-            Option<&Entry<ScalarOrVec>>,
-        )>,
-    ) -> Self {
-        // Check all input pods are valid.
-        for pod in inputs {
-            match pod {
-                SchnorrOrGODPOD::GODPOD(p) => {
-                    assert!(p.verify().expect("input GODPOD verification failed"));
-                }
-                SchnorrOrGODPOD::SchnorrPOD(p) => {
-                    assert!(p.verify().expect("input SchnorrPOD verification failed"));
-                }
-            }
-        }
-        // Compile/arrange list of statements as Vec<Statement> (after converting each `Entry` into a `ValueOf` statement).
-        // and then remap
-        let remapped_statements = to_statements_with_remapping(inputs);
-
-        // apply operations one by one on remapped_statements
-        let mut final_statements = Vec::new();
-        for (operation, idx1, idx2, idx3, entry) in operations {
-            let statement1 = match idx1 {
-                Some(idx) => Some(&remapped_statements[*idx]),
-                None => None,
-            };
-            let statement2 = match idx2 {
-                Some(idx) => Some(&remapped_statements[*idx]),
-                None => None,
-            };
-            let statement3 = match idx3 {
-                Some(idx) => Some(&remapped_statements[*idx]),
-                None => None,
-            };
-            let optional_entry = match entry {
-                Some(entry) => Some(*entry),
-                None => None,
-            };
-            final_statements.push(operation.apply_operation(
-                GadgetID::GOD,
-                statement1,
-                statement2,
-                statement3,
-                optional_entry,
-            ))
-        }
-
-        GODPOD::new(
-            &final_statements
-                .iter()
-                .map(|maybe_statement| maybe_statement.clone().unwrap())
-                .collect::<Vec<Statement>>(),
-        )
     }
 }
 
@@ -635,68 +524,71 @@ pub struct OperationCmd {
     pub statement_2_name: Option<String>,
     pub statement_3_origin: Option<String>,
     pub statement_3_name: Option<String>,
-    pub optional_entry: Option<(String, ScalarOrVec)>,
+    pub optional_entry: Option<Entry>,
     pub output_statement_name: String,
 }
 
 impl OperationCmd {
+    fn get_statement_with_origin_and_name(
+        statements: &HashMap<String, HashMap<String, Statement>>,
+        origin: Option<String>,
+        name: Option<String>,
+    ) -> Option<Statement> {
+        if let Some(origin) = origin {
+            if let Some(name) = name {
+                if let Some(map) = statements.get(&origin) {
+                    if let Some(statement) = map.get(&name) {
+                        return Some(statement.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn execute(
         &self,
         gadget_id: GadgetID,
-        in_statements: &HashMap<String, HashMap<String, Statement>>,
-        self_statements: &HashMap<String, Statement>,
-    ) -> Result<Statement, Error> {
-        Err("unimplemented".into())
-    }
-}
-
-impl OperationType {
-    pub fn apply_operation<V: HashableEntryValue>(
-        &self,
-        gadget_id: GadgetID,
-        statement1: Option<&Statement>,
-        statement2: Option<&Statement>,
-        statement3: Option<&Statement>,
-        optional_entry: Option<&Entry<V>>,
+        statements: &HashMap<String, HashMap<String, Statement>>,
     ) -> Option<Statement> {
-        match (self, statement1, statement2, statement3, optional_entry) {
+        let statement1 = OperationCmd::get_statement_with_origin_and_name(
+            statements,
+            self.statement_1_name.clone(),
+            self.statement_1_origin.clone(),
+        );
+        let statement2 = OperationCmd::get_statement_with_origin_and_name(
+            statements,
+            self.statement_2_name.clone(),
+            self.statement_2_origin.clone(),
+        );
+        let statement3 = OperationCmd::get_statement_with_origin_and_name(
+            statements,
+            self.statement_3_name.clone(),
+            self.statement_3_origin.clone(),
+        );
+        let optional_entry = self.optional_entry.clone();
+
+        match (
+            self.operation_type,
+            statement1,
+            statement2,
+            statement3,
+            optional_entry,
+        ) {
             // A new statement is created from a single `Entry`.
-            (Self::NewEntry, _, _, _, Some(entry)) => Some(entry_to_statement(&entry, gadget_id)),
-            // SumOf <=> statement 1's value = statement 2's value + statement 3's value
-            (Self::SumOf, Some(statement1), Some(statement2), Some(statement3), _) => {
-                if [
-                    statement1.predicate,
-                    statement2.predicate,
-                    statement3.predicate,
-                ]
-                .into_iter()
-                .all(|p| p == StatementPredicate::ValueOf)
-                    && (statement1.optional_value?
-                        == statement2.optional_value? + statement3.optional_value?)
-                {
-                    Some(Statement {
-                        predicate: StatementPredicate::SumOf,
-                        origin1: statement1.origin1,
-                        key1: statement1.key1.clone(),
-                        origin2: Some(statement2.origin1),
-                        key2: Some(statement2.key1.clone()),
-                        origin3: Some(statement3.origin1),
-                        key3: Some(statement3.key1.clone()),
-                        optional_value: None,
-                    })
-                } else {
-                    None
-                }
+            (OperationType::NewEntry, _, _, _, Some(entry)) => {
+                return Some(Statement::from_entry(&entry, gadget_id));
             }
             // A statement is copied from a single (left) statement.
-            (Self::CopyStatement, Some(statement), _, _, _) => Some(statement.clone()),
+            (OperationType::CopyStatement, Some(statement), _, _, _) => Some(statement.clone()),
             // Eq <=> Left entry = right entry
-            (Self::EqualityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
+            (OperationType::EqualityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
                 match (left_entry.predicate, right_entry.predicate) {
                     (StatementPredicate::ValueOf, StatementPredicate::ValueOf)
                         if left_entry.optional_value == right_entry.optional_value =>
                     {
-                        Some(Statement {
+                        return Some(Statement {
+                            name: self.output_statement_name.clone(),
                             predicate: StatementPredicate::Equal,
                             origin1: left_entry.origin1,
                             key1: left_entry.key1.clone(),
@@ -705,18 +597,21 @@ impl OperationType {
                             origin3: None,
                             key3: None,
                             optional_value: None,
-                        })
+                        });
                     }
-                    _ => None,
+                    _ => {
+                        return None;
+                    }
                 }
             }
             // Neq <=> Left entry != right entry
-            (Self::NonequalityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
+            (OperationType::NonequalityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
                 match (left_entry.predicate, right_entry.predicate) {
                     (StatementPredicate::ValueOf, StatementPredicate::ValueOf)
                         if left_entry.optional_value != right_entry.optional_value =>
                     {
-                        Some(Statement {
+                        return Some(Statement {
+                            name: self.output_statement_name.clone(),
                             predicate: StatementPredicate::NotEqual,
                             origin1: left_entry.origin1,
                             key1: left_entry.key1.clone(),
@@ -725,13 +620,15 @@ impl OperationType {
                             origin3: None,
                             key3: None,
                             optional_value: None,
-                        })
+                        });
                     }
-                    _ => None,
+                    _ => {
+                        return None;
+                    }
                 }
             }
             // Gt <=> Left entry > right entry
-            (Self::GtFromEntries, Some(left_entry), Some(right_entry), _, _) => {
+            (OperationType::GtFromEntries, Some(left_entry), Some(right_entry), _, _) => {
                 match (
                     left_entry.predicate,
                     left_entry.optional_value,
@@ -740,11 +637,12 @@ impl OperationType {
                 ) {
                     (
                         StatementPredicate::ValueOf,
-                        Some(left_value),
+                        Some(ScalarOrVec::Scalar(left_value)),
                         StatementPredicate::ValueOf,
-                        Some(right_value),
+                        Some(ScalarOrVec::Scalar(right_value)),
                     ) if left_value.to_canonical_u64() > right_value.to_canonical_u64() => {
-                        Some(Statement {
+                        return Some(Statement {
+                            name: self.output_statement_name.clone(),
                             predicate: StatementPredicate::Gt,
                             origin1: left_entry.origin1,
                             key1: left_entry.key1.clone(),
@@ -753,15 +651,17 @@ impl OperationType {
                             origin3: None,
                             key3: None,
                             optional_value: None,
-                        })
+                        });
                     }
-                    _ => None,
+                    _ => {
+                        return None;
+                    }
                 }
             }
             // Equality deduction: a = b ∧ b = c => a = c.
             // TODO: Allow for permutations of left/right values.
             (
-                Self::TransitiveEqualityFromStatements,
+                OperationType::TransitiveEqualityFromStatements,
                 Some(left_statement),
                 Some(right_statement),
                 _,
@@ -769,12 +669,14 @@ impl OperationType {
             ) => match (left_statement, right_statement) {
                 (
                     Statement {
+                        name: _,
                         predicate: StatementPredicate::Equal,
                         origin1: ll_origin,
                         key1: ll_key_name,
                         origin2:
                             Some(Origin {
                                 origin_id: lr_origin_id,
+                                origin_name: _,
                                 gadget_id: _,
                             }),
                         key2: Some(lr_key_name),
@@ -783,10 +685,12 @@ impl OperationType {
                         optional_value: _,
                     },
                     Statement {
+                        name: _,
                         predicate: StatementPredicate::Equal,
                         origin1:
                             Origin {
                                 origin_id: rl_origin_id,
+                                origin_name: _,
                                 gadget_id: _,
                             },
                         key1: rl_key_name,
@@ -798,10 +702,11 @@ impl OperationType {
                     },
                 ) if (lr_origin_id, &lr_key_name) == ((rl_origin_id, &rl_key_name)) => {
                     Some(Statement {
+                        name: self.output_statement_name.clone(),
                         predicate: StatementPredicate::Equal,
-                        origin1: *ll_origin,
+                        origin1: ll_origin.clone(),
                         key1: ll_key_name.clone(),
-                        origin2: *rr_origin,
+                        origin2: rr_origin.clone(),
                         key2: rr_key_name.clone(),
                         origin3: None,
                         key3: None,
@@ -810,8 +715,10 @@ impl OperationType {
                 }
                 _ => None,
             },
-            (Self::GtToNonequality, Some(left_statement), _, _, _) => match left_statement {
+            (OperationType::GtToNonequality, Some(left_statement), _, _, _) => match left_statement
+            {
                 Statement {
+                    name: _,
                     predicate: StatementPredicate::Gt,
                     origin1: left_origin,
                     key1: left_key_name,
@@ -821,10 +728,11 @@ impl OperationType {
                     key3: None,
                     optional_value: _,
                 } => Some(Statement {
+                    name: self.output_statement_name.clone(),
                     predicate: StatementPredicate::NotEqual,
-                    origin1: *left_origin,
+                    origin1: left_origin.clone(),
                     key1: left_key_name.clone(),
-                    origin2: *right_origin,
+                    origin2: right_origin.clone(),
                     key2: right_key_name.clone(),
                     origin3: None,
                     key3: None,
@@ -832,8 +740,74 @@ impl OperationType {
                 }),
                 _ => None,
             },
-            // TODO. also first need to make it so statement values can be vectors
-            (Self::Contains, _, _, _, _) => None,
+            (OperationType::Contains, Some(left_entry), Some(right_entry), _, _) => {
+                match (
+                    left_entry.predicate,
+                    left_entry.optional_value,
+                    right_entry.predicate,
+                    right_entry.optional_value,
+                ) {
+                    (
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Vector(vec1)),
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Scalar(val)),
+                    ) => {
+                        if vec1.contains(&val) {
+                            return Some(Statement {
+                                name: self.output_statement_name.clone(),
+                                predicate: StatementPredicate::Contains,
+                                origin1: left_entry.origin1,
+                                key1: left_entry.key1.clone(),
+                                origin2: Some(right_entry.origin1),
+                                key2: Some(right_entry.key1.clone()),
+                                origin3: None,
+                                key3: None,
+                                optional_value: None,
+                            });
+                        }
+                        return None;
+                    }
+                    _ => {
+                        return None;
+                    }
+                }
+            }
+            // SumOf <=> statement 1's value = statement 2's value + statement 3's value
+            (OperationType::SumOf, Some(statement1), Some(statement2), Some(statement3), _) => {
+                match (
+                    statement1.predicate,
+                    statement1.optional_value,
+                    statement2.predicate,
+                    statement2.optional_value,
+                    statement3.predicate,
+                    statement3.optional_value,
+                ) {
+                    (
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Scalar(sum)),
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Scalar(left_addend)),
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Scalar(right_addend)),
+                    ) if (sum == left_addend + right_addend) => {
+                        return Some(Statement {
+                            name: self.output_statement_name.clone(),
+                            predicate: StatementPredicate::SumOf,
+                            origin1: statement1.origin1,
+                            key1: statement1.key1.clone(),
+                            origin2: Some(statement2.origin1),
+                            key2: Some(statement2.key1.clone()),
+                            origin3: Some(statement3.origin1),
+                            key3: Some(statement3.key1.clone()),
+                            optional_value: None,
+                        });
+                    }
+                    _ => {
+                        return None;
+                    }
+                }
+            }
             _ => None,
         }
     }
