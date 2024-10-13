@@ -1,10 +1,8 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 //use circuit::pod2_circuit;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
-use plonky2::field::types::PrimeField64;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::GenericHashOut;
 use plonky2::plonk::config::Hasher;
@@ -22,117 +20,19 @@ mod util;
 
 pub(crate) type Error = Box<dyn std::error::Error>;
 
-pub trait HashablePayload: Clone + PartialEq {
-    fn to_field_vec(&self) -> Vec<GoldilocksField>;
-
-    fn hash_payload(&self) -> GoldilocksField {
-        let ins = self.to_field_vec();
-        PoseidonHash::hash_no_pad(&ins).to_vec()[0]
-    }
-}
-
-impl<V: EntryValue> HashablePayload for Vec<Entry<V>> {
-    fn to_field_vec(&self) -> Vec<GoldilocksField> {
-        // let mut sorted_by_key_name = self.clone();
-        // sorted_by_key_name.sort_by(|a, b| a.key_name.cmp(&b.key_name));
-        let mut ins = Vec::new();
-        // sorted_by_key_name.iter().for_each(|entry| {
-        //     ins.push(entry.key_hash);
-        //     ins.push(entry.value_hash);
-        // });
-        self.iter().for_each(|entry| {
-            ins.push(entry.key_hash);
-            ins.push(entry.value_hash);
-        });
-        ins
-    }
-}
-
-// TODO
-impl HashablePayload for Vec<Statement> {
-    fn to_field_vec(&self) -> Vec<GoldilocksField> {
-        self.iter()
-            .map(|statement| {
-                [
-                    vec![
-                        GoldilocksField(statement.predicate as u64),
-                        statement.origin1.origin_id,
-                        GoldilocksField(statement.origin1.gadget_id as u64),
-                        hash_string_to_field(&statement.key1),
-                    ],
-                    match statement.origin2 {
-                        Some(ro) => vec![ro.origin_id, GoldilocksField(ro.gadget_id as u64)],
-                        _ => vec![GoldilocksField(0), GoldilocksField(0)],
-                    },
-                    vec![
-                        match &statement.key2 {
-                            Some(rkn) => hash_string_to_field(&rkn),
-                            _ => GoldilocksField::ZERO,
-                        },
-                        match statement.optional_value {
-                            Some(x) => x,
-                            _ => GoldilocksField::ZERO,
-                        },
-                    ],
-                ]
-                .concat()
-            })
-            .collect::<Vec<Vec<GoldilocksField>>>()
-            .concat()
-    }
-}
-
-pub trait ProofOf<Payload>: Clone {
-    fn verify(&self, payload: &Payload) -> Result<bool, Error>;
-}
-
-// verify schnorr POD
-impl ProofOf<Vec<Entry<ScalarOrVec>>> for SchnorrSignature {
-    fn verify(&self, payload: &Vec<Entry<ScalarOrVec>>) -> Result<bool, Error> {
-        let payload_hash = payload.hash_payload();
-        let payload_hash_vec = vec![payload_hash];
-        let protocol = SchnorrSigner::new();
-        let wrapped_pk = payload
-            .iter()
-            .filter(|entry| entry.key_name == "_signer")
-            .collect::<Vec<&Entry<ScalarOrVec>>>();
-        if wrapped_pk.len() == 0 {
-            return Err("No signer found in payload".into());
-        }
-
-        let pk = match wrapped_pk[0].value {
-            ScalarOrVec::Vector(_) => Err(Error::from("Signer is a vector")),
-            ScalarOrVec::Scalar(s) => Ok(s),
-        }?;
-        Ok(protocol.verify(&self, &payload_hash_vec, &SchnorrPublicKey { pk }))
-    }
-}
-
-// verify GODPOD
-impl ProofOf<Vec<Statement>> for SchnorrSignature {
-    fn verify(&self, payload: &Vec<Statement>) -> Result<bool, Error> {
-        let payload_hash = payload.hash_payload();
-        let payload_hash_vec = vec![payload_hash];
-        let protocol = SchnorrSigner::new();
-        Ok(protocol.verify(
-            &self,
-            &payload_hash_vec,
-            &protocol.keygen(&SchnorrSecretKey { sk: 0 }), // hardcoded secret key
-        ))
-    }
-}
-
-pub trait EntryValue: Clone + PartialEq {
+// EntryValue trait, and ScalarOrVec type which implements it.
+// This is a field element or array of field elements.
+pub trait HashableEntryValue: Clone + PartialEq {
     fn hash_or_value(&self) -> GoldilocksField;
 }
 
-impl EntryValue for GoldilocksField {
+impl HashableEntryValue for GoldilocksField {
     fn hash_or_value(&self) -> GoldilocksField {
         *self
     }
 }
 
-impl EntryValue for Vec<GoldilocksField> {
+impl HashableEntryValue for Vec<GoldilocksField> {
     fn hash_or_value(&self) -> GoldilocksField {
         PoseidonHash::hash_no_pad(self).to_vec()[0]
     }
@@ -144,7 +44,7 @@ pub enum ScalarOrVec {
     Vector(Vec<GoldilocksField>),
 }
 
-impl EntryValue for ScalarOrVec {
+impl HashableEntryValue for ScalarOrVec {
     fn hash_or_value(&self) -> GoldilocksField {
         match self {
             Self::Scalar(s) => s.hash_or_value(),
@@ -153,45 +53,33 @@ impl EntryValue for ScalarOrVec {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
-#[repr(usize)]
-pub enum GadgetID {
-    NONE = 0,
-    SCHNORR16 = 1,
-    GOD = 2,
+// An Entry, which is just a key-value pair.
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub key: String,
+    pub value: ScalarOrVec,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+// An Origin, which represents a reference to an ancestor POD.
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Origin {
     pub origin_id: GoldilocksField, // reserve 0 for NONE, 1 for SELF
+    pub origin_name: String,
     pub gadget_id: GadgetID, // if origin_id is SELF, this is none; otherwise, it's the gadget_id
 }
 
 impl Origin {
     pub const NONE: Self = Origin {
         origin_id: GoldilocksField::ZERO,
+        origin_name: String::new(),
         gadget_id: GadgetID::NONE,
     };
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Entry<V: EntryValue> {
-    pub key_name: String,
-    pub key_hash: GoldilocksField,
-    pub value_hash: GoldilocksField,
-    pub value: V,
-}
-
-impl<V: EntryValue> Entry<V> {
-    fn new(key_name: &str, value: V) -> Self {
-        Entry {
-            key_name: key_name.to_string(),
-            key_hash: hash_string_to_field(key_name),
-            value_hash: value.hash_or_value(),
-            value,
-        }
-    }
-}
+// A Statement, which is a claim about one or more entries.
+// Entries are ValueOf statements.
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u64)]
@@ -207,6 +95,7 @@ pub enum StatementPredicate {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Statement {
+    pub name: String, // human-readable name that can be referenced in operations
     pub predicate: StatementPredicate,
     pub origin1: Origin,
     pub key1: String,
@@ -214,151 +103,405 @@ pub struct Statement {
     pub key2: Option<String>,
     pub origin3: Option<Origin>,
     pub key3: Option<String>,
-    pub optional_value: Option<GoldilocksField>, // todo: figure out how to allow this to be any EntryValue
+    pub optional_value: Option<ScalarOrVec>, // todo: figure out how to allow this to be any EntryValue
 }
 
-pub fn entry_to_statement<V: EntryValue>(entry: &Entry<V>, gadget_id: GadgetID) -> Statement {
-    Statement {
-        predicate: StatementPredicate::ValueOf,
-        origin1: Origin {
-            origin_id: GoldilocksField(1),
-            gadget_id,
-        },
-        key1: entry.key_name.clone(),
-        origin2: None,
-        key2: None,
-        origin3: None,
-        key3: None,
-        optional_value: Some(entry.value.hash_or_value()),
+impl Statement {
+    pub fn from_entry(entry: &Entry, this_gadget_id: GadgetID) -> Self {
+        Statement {
+            name: entry.key.to_string(),
+            predicate: StatementPredicate::ValueOf,
+            origin1: Origin {
+                origin_id: GoldilocksField(1),
+                origin_name: "_SELF".to_string(),
+                gadget_id: this_gadget_id,
+            },
+            key1: entry.key.to_string(),
+            origin2: None,
+            key2: None,
+            origin3: None,
+            key3: None,
+            optional_value: Some(entry.value.clone()),
+        }
     }
 }
 
-impl<V: EntryValue> Into<Statement> for Entry<V> {
-    fn into(self) -> Statement {
-        entry_to_statement(&self, GadgetID::NONE)
+// HashablePayload trait, and PODPayload which implements it.
+
+pub trait HashablePayload: Clone + PartialEq {
+    fn to_field_vec(&self) -> Vec<GoldilocksField>;
+
+    fn hash_payload(&self) -> GoldilocksField {
+        let ins = self.to_field_vec();
+        PoseidonHash::hash_no_pad(&ins).to_vec()[0]
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct POD<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usize> {
-    pub payload: Payload,
-    proof: Proof,
+pub struct PODPayload {
+    pub statements_list: Vec<Statement>, // ORDERED list of statements, ordered by names
+    pub statements_map: HashMap<String, Statement>,
 }
 
-type SchnorrPOD = POD<Vec<Entry<ScalarOrVec>>, SchnorrSignature, { GadgetID::SCHNORR16 as usize }>;
+impl PODPayload {
+    pub fn new(statements: HashMap<String, Statement>) -> Self {
+        let mut statements_list = Vec::new();
+        for (_, statement) in statements.iter() {
+            statements_list.push(statement.clone());
+        }
+        statements_list.sort_by(|a, b| a.name.cmp(&b.name));
+        Self {
+            statements_list,
+            statements_map: statements.clone(),
+        }
+    }
+}
 
-type GODPOD = POD<Vec<Statement>, SchnorrSignature, { GadgetID::GOD as usize }>;
+impl HashablePayload for Vec<Statement> {
+    fn to_field_vec(&self) -> Vec<GoldilocksField> {
+        self.iter()
+            .map(|statement| {
+                [
+                    vec![
+                        GoldilocksField(statement.predicate as u64),
+                        statement.origin1.origin_id,
+                        GoldilocksField(statement.origin1.gadget_id as u64),
+                        hash_string_to_field(&statement.key1),
+                    ],
+                    match &statement.origin2 {
+                        Some(o) => vec![o.origin_id, GoldilocksField(o.gadget_id as u64)],
+                        _ => vec![GoldilocksField(0), GoldilocksField(0)],
+                    },
+                    match &statement.key2 {
+                        Some(kn) => vec![hash_string_to_field(&kn)],
+                        _ => vec![GoldilocksField::ZERO],
+                    },
+                    match &statement.origin3 {
+                        Some(o) => vec![o.origin_id, GoldilocksField(o.gadget_id as u64)],
+                        _ => vec![GoldilocksField(0), GoldilocksField(0)],
+                    },
+                    match &statement.key3 {
+                        Some(kn) => vec![hash_string_to_field(&kn)],
+                        _ => vec![GoldilocksField::ZERO],
+                    },
+                    match &statement.optional_value {
+                        Some(x) => vec![x.hash_or_value()],
+                        _ => vec![GoldilocksField::ZERO],
+                    },
+                ]
+                .concat()
+            })
+            .collect::<Vec<Vec<GoldilocksField>>>()
+            .concat()
+    }
+}
+
+impl HashablePayload for PODPayload {
+    fn to_field_vec(&self) -> Vec<GoldilocksField> {
+        self.statements_list.to_field_vec()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum GadgetID {
+    NONE = 0,
+    SCHNORR16 = 1,
+    ORACLE = 2,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PODProof {
+    Schnorr(SchnorrSignature),
+    Oracle(SchnorrSignature),
+}
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum SchnorrOrGODPOD {
-    SchnorrPOD(SchnorrPOD),
-    GODPOD(GODPOD),
+pub struct POD {
+    pub payload: PODPayload,
+    proof: PODProof,
+    pub proof_type: GadgetID,
 }
 
-impl<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usize>
-    POD<Payload, Proof, FromGadgetID>
-{
+impl POD {
     pub fn verify(&self) -> Result<bool, Error> {
-        self.proof.verify(&self.payload)
-    }
-}
+        match self.proof {
+            PODProof::Schnorr(p) => {
+                if self.proof_type != GadgetID::SCHNORR16 {
+                    return Err("Proof and POD proofType mismatch".into());
+                }
 
-impl SchnorrPOD {
-    pub fn gadget(entries: &Vec<Entry<ScalarOrVec>>, sk: &SchnorrSecretKey) -> Self {
+                let payload_hash = self.payload.hash_payload();
+                let payload_hash_vec = vec![payload_hash];
+                let protocol = SchnorrSigner::new();
+
+                let wrapped_pk = self
+                    .payload
+                    .statements_list
+                    .iter()
+                    .filter(|&statement| {
+                        statement.predicate == StatementPredicate::ValueOf
+                            && statement.key1 == "_signer"
+                    })
+                    .collect::<Vec<&Statement>>();
+
+                if wrapped_pk.len() == 0 {
+                    return Err("No signer found in payload".into());
+                }
+
+                let pk = match wrapped_pk[0].optional_value {
+                    Some(ScalarOrVec::Vector(_)) => Err(Error::from("Signer is a vector")),
+                    Some(ScalarOrVec::Scalar(s)) => Ok(s),
+                    _ => Err("_signer key found but no corresponding value".into()),
+                }?;
+                Ok(protocol.verify(&p, &payload_hash_vec, &SchnorrPublicKey { pk }))
+            }
+            PODProof::Oracle(p) => {
+                if self.proof_type != GadgetID::ORACLE {
+                    return Err("Proof and POD proofType mismatch".into());
+                }
+
+                let payload_hash = self.payload.hash_payload();
+                let payload_hash_vec = vec![payload_hash];
+                let protocol = SchnorrSigner::new();
+
+                Ok(protocol.verify(
+                    &p,
+                    &payload_hash_vec,
+                    &protocol.keygen(&SchnorrSecretKey { sk: 0 }), // hardcoded secret key
+                ))
+            }
+            _ => Err("Invalid proof type".into()),
+        }
+    }
+
+    pub fn execute_schnorr_gadget(entries: &Vec<Entry>, sk: &SchnorrSecretKey) -> Self {
         let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
         let protocol = SchnorrSigner::new();
 
-        let mut payload = entries.clone();
-        payload.push(Entry::new(
-            "_signer",
-            ScalarOrVec::Scalar(protocol.keygen(sk).pk),
-        ));
+        let mut kv_pairs = entries.clone();
+        kv_pairs.push(Entry {
+            key: "_signer".to_string(),
+            value: ScalarOrVec::Scalar(protocol.keygen(sk).pk),
+        });
+        let mut statement_map: HashMap<String, Statement> = HashMap::new();
+
+        for entry in kv_pairs {
+            statement_map.insert(
+                entry.key.clone(),
+                Statement::from_entry(&entry, GadgetID::SCHNORR16),
+            );
+        }
+
+        let payload = PODPayload::new(statement_map);
         let payload_hash = payload.hash_payload();
         let payload_hash_vec = vec![payload_hash];
         let proof = protocol.sign(&payload_hash_vec, sk, &mut rng);
-        Self { payload, proof }
+        Self {
+            payload,
+            proof: PODProof::Schnorr(proof),
+            proof_type: GadgetID::SCHNORR16,
+        }
     }
-}
 
-pub fn remap_origin_ids(inputs: &Vec<Vec<Statement>>) -> Vec<Vec<Statement>> {
-    let mut all_in_origin_ids = Vec::new();
-    for i in 0..inputs.len() {
-        for statement in inputs[i].iter() {
-            let left_origin_tuple = (i, statement.origin1.origin_id);
-            if !all_in_origin_ids.contains(&left_origin_tuple) {
-                all_in_origin_ids.push(left_origin_tuple);
+    fn remap_origin_ids_by_name(
+        inputs: GPGInput,
+    ) -> Result<HashMap<String, HashMap<String, Statement>>, Error> {
+        let mut new_origin_name_list = Vec::new();
+        for (_, new_name) in inputs.origin_renaming_map.iter() {
+            new_origin_name_list.push(new_name.clone());
+        }
+        new_origin_name_list.sort();
+
+        let mut new_origin_name_to_id_map = HashMap::new();
+        for (idx, new_name) in new_origin_name_list.iter().enumerate() {
+            new_origin_name_to_id_map.insert(new_name.clone(), idx + 2); // 0 reserved for none, 1 reserved for _SELF
+        }
+
+        let mut statements_with_renamed_origins = HashMap::new();
+
+        for (pod_idx, (pod_name, pod)) in inputs.pods_list.iter().enumerate() {
+            let mut inner_map = HashMap::new();
+
+            for statement in pod.payload.statements_list.iter() {
+                let mut statement_with_remapped_origins = statement.clone();
+                let pod_name_clone = pod_name.clone();
+                // origin 1
+                let new_origin1_name = inputs
+                    .origin_renaming_map
+                    .get(&(pod_name.clone(), statement.origin1.origin_name.clone()));
+                match new_origin1_name {
+                    Some(new_origin1_name) => {
+                        let new_origin1_id = new_origin_name_to_id_map.get(new_origin1_name);
+                        match new_origin1_id {
+                            Some(&new_origin1_id) => {
+                                statement_with_remapped_origins.origin1 = Origin {
+                                    origin_id: GoldilocksField(new_origin1_id as u64),
+                                    origin_name: new_origin1_name.clone(),
+                                    gadget_id: statement.origin1.gadget_id,
+                                }
+                            }
+                            None => {
+                                return Err(("couldn't find id for new origin: ".to_string()
+                                    + new_origin1_name)
+                                    .into());
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(("couldn't find new origin name for origin: ".to_string()
+                            + &pod_name.clone()
+                            + "."
+                            + &statement.origin1.origin_name.clone())
+                            .into())
+                    }
+                }
+                // origin 2
+                if let Some(old_origin2) = &statement.origin2 {
+                    let new_origin2_name = inputs
+                        .origin_renaming_map
+                        .get(&(pod_name.clone(), old_origin2.origin_name.clone()));
+                    match new_origin2_name {
+                        Some(new_origin2_name) => {
+                            let new_origin2_id = new_origin_name_to_id_map.get(new_origin2_name);
+                            match new_origin2_id {
+                                Some(&new_origin2_id) => {
+                                    statement_with_remapped_origins.origin2 = Some(Origin {
+                                        origin_id: GoldilocksField(new_origin2_id as u64),
+                                        origin_name: new_origin2_name.clone(),
+                                        gadget_id: old_origin2.gadget_id,
+                                    })
+                                }
+                                None => {
+                                    return Err(("couldn't find id for new origin: ".to_string()
+                                        + new_origin2_name)
+                                        .into());
+                                }
+                            }
+                        }
+                        None => {
+                            return Err(("couldn't find new origin name for origin: ".to_string()
+                                + &pod_name.clone()
+                                + "."
+                                + &old_origin2.origin_name.clone())
+                                .into())
+                        }
+                    }
+                }
+                // origin 3
+                if let Some(old_origin3) = &statement.origin3 {
+                    let new_origin3_name = inputs
+                        .origin_renaming_map
+                        .get(&(pod_name.clone(), old_origin3.origin_name.clone()));
+                    match new_origin3_name {
+                        Some(new_origin3_name) => {
+                            let new_origin3_id = new_origin_name_to_id_map.get(new_origin3_name);
+                            match new_origin3_id {
+                                Some(&new_origin3_id) => {
+                                    statement_with_remapped_origins.origin3 = Some(Origin {
+                                        origin_id: GoldilocksField(new_origin3_id as u64),
+                                        origin_name: new_origin3_name.clone(),
+                                        gadget_id: old_origin3.gadget_id,
+                                    })
+                                }
+                                None => {
+                                    return Err(("couldn't find id for new origin: ".to_string()
+                                        + new_origin3_name)
+                                        .into());
+                                }
+                            }
+                        }
+                        None => {
+                            return Err(("couldn't find new origin name for origin: ".to_string()
+                                + &pod_name.clone()
+                                + "."
+                                + &old_origin3.origin_name.clone())
+                                .into())
+                        }
+                    }
+                }
+
+                inner_map.insert(statement.name.clone(), statement_with_remapped_origins);
             }
+            statements_with_renamed_origins.insert(pod_name.clone(), inner_map);
+        }
 
-            if let Some(right_origin) = statement.origin2 {
-                let right_origin_tuple = (i, right_origin.origin_id);
-                if !all_in_origin_ids.contains(&right_origin_tuple) {
-                    all_in_origin_ids.push(right_origin_tuple);
+        Ok(statements_with_renamed_origins)
+    }
+
+    fn get_statement_with_origin_and_name(
+        statements: &HashMap<String, HashMap<String, Statement>>,
+        self_statements: &HashMap<String, Statement>,
+        origin: Option<String>,
+        name: Option<String>,
+    ) -> Option<Statement> {
+        if let Some(origin) = origin {
+            if let Some(name) = name {
+                if origin == "_SELF" {
+                    return self_statements.get(&name).cloned();
+                }
+                if let Some(map) = statements.get(&origin) {
+                    if let Some(statement) = map.get(&name) {
+                        return Some(statement.clone());
+                    }
                 }
             }
         }
+        None
     }
 
-    // sort all_in_origin_ids in place
-    all_in_origin_ids.sort_by(|a, b| {
-        let first_cmp = a.0.cmp(&b.0);
-        if first_cmp == Ordering::Equal {
-            (a.1).to_canonical_u64().cmp(&(b.1).to_canonical_u64())
-        } else {
-            first_cmp
-        }
-    });
+    pub fn execute_oracle_gadget(input: GPGInput, cmds: &Vec<OperationCmd>) -> Result<Self, Error> {
+        let statements = POD::remap_origin_ids_by_name(input);
+        match &statements {
+            Ok(statements) => {
+                let mut out_statements = HashMap::new();
+                for cmd in cmds {
+                    let statement1 = POD::get_statement_with_origin_and_name(
+                        statements,
+                        &out_statements,
+                        cmd.statement_1_name.clone(),
+                        cmd.statement_1_origin.clone(),
+                    );
+                    let statement2 = POD::get_statement_with_origin_and_name(
+                        &statements,
+                        &out_statements,
+                        cmd.statement_2_name.clone(),
+                        cmd.statement_2_origin.clone(),
+                    );
+                    let statement3 = POD::get_statement_with_origin_and_name(
+                        &statements,
+                        &out_statements,
+                        cmd.statement_3_name.clone(),
+                        cmd.statement_3_origin.clone(),
+                    );
+                    let new_statement = cmd.execute(GadgetID::ORACLE, statements, &out_statements);
+                    match new_statement {
+                        Ok(new_statement) => {
+                            out_statements.insert(cmd.output_statement_name.clone(), new_statement);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                let out_payload = PODPayload::new(out_statements);
+                let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
+                let protocol = SchnorrSigner::new();
+                let payload_hash = out_payload.hash_payload();
+                let payload_hash_vec = vec![payload_hash];
 
-    let mut origin_id_map = HashMap::new();
-    for idx_and_origin_id in all_in_origin_ids.iter().enumerate() {
-        origin_id_map.insert(idx_and_origin_id.1, (idx_and_origin_id.0 + 2) as u64);
-    }
-
-    let mut remapped_inputs = Vec::new();
-
-    println!("origin id map: {:?}", origin_id_map);
-
-    for (idx, input) in inputs.iter().enumerate() {
-        let mut remapped_input = Vec::new();
-        for statement in input {
-            let mut remapped_statement = statement.clone();
-            println!("index: {:?}", idx);
-            println!("OLD statement: {:?}", remapped_statement);
-            remapped_statement.origin1.origin_id = GoldilocksField(
-                *origin_id_map
-                    .get(&(idx, remapped_statement.origin1.origin_id))
-                    .unwrap(),
-            );
-            if let Some(right_origin) = remapped_statement.origin2 {
-                remapped_statement.origin2 = Some(Origin {
-                    origin_id: GoldilocksField(
-                        *origin_id_map.get(&(idx, right_origin.origin_id)).unwrap(),
-                    ),
-                    gadget_id: right_origin.gadget_id,
-                });
+                // signature is a hardcoded skey (currently 0)
+                // todo is to build a limited version of this with a ZKP
+                // would start by making it so that the ZKP only allows
+                // a max number of input PODs, max number of entries/statements per input POD,
+                // max number of statements for output POD, and some max number of each type of operation
+                let proof = protocol.sign(&payload_hash_vec, &SchnorrSecretKey { sk: 0 }, &mut rng);
+                Ok(Self {
+                    payload: out_payload,
+                    proof: PODProof::Oracle(proof),
+                    proof_type: GadgetID::ORACLE,
+                })
             }
-            println!("NEW statement: {:?}", remapped_statement);
-            remapped_input.push(remapped_statement);
+            Err(e) => Err(*e),
         }
-        remapped_inputs.push(remapped_input);
     }
-    remapped_inputs
-}
-
-pub fn to_statements_with_remapping(inputs: &Vec<&SchnorrOrGODPOD>) -> Vec<Statement> {
-    let statements = inputs
-        .iter()
-        .map(|pod| match pod {
-            SchnorrOrGODPOD::GODPOD(p) => p.clone().payload,
-            SchnorrOrGODPOD::SchnorrPOD(p) => p
-                .payload
-                .iter()
-                .map(|entry| entry_to_statement(entry, GadgetID::SCHNORR16))
-                .collect::<Vec<Statement>>(),
-        })
-        .collect::<Vec<Vec<Statement>>>();
-
-    // Now remap
-    remap_origin_ids(&statements).concat()
 }
 
 impl GODPOD {
@@ -381,7 +524,7 @@ impl GODPOD {
     pub fn gadget(
         inputs: &Vec<&SchnorrOrGODPOD>, // will be converted to a vector of statements
         operations: &Vec<(
-            Operation,
+            OperationType,
             Option<usize>,
             Option<usize>,
             Option<usize>,
@@ -440,8 +583,37 @@ impl GODPOD {
     }
 }
 
+// Operations
+
+pub struct GPGInput {
+    pub pods_list: Vec<(String, POD)>, // ORDERED list of pods, ordered by names
+    pub pods_map: HashMap<String, POD>, // map from pod name to pod
+
+    // map from (pod name, old origin name) to new origin name
+    pub origin_renaming_map: HashMap<(String, String), String>,
+}
+
+impl GPGInput {
+    pub fn new(
+        named_pods: HashMap<String, POD>,
+        origin_renaming_map: HashMap<(String, String), String>,
+    ) -> Self {
+        let mut pods_and_names_list = Vec::new();
+        for (name, pod) in named_pods.iter() {
+            pods_and_names_list.push((name.clone(), pod.clone()));
+        }
+        pods_and_names_list.sort_by(|a, b| a.0.cmp(&b.0));
+
+        return Self {
+            pods_list: pods_and_names_list.clone(),
+            pods_map: named_pods.clone(),
+            origin_renaming_map: origin_renaming_map.clone(),
+        };
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
-pub enum Operation {
+pub enum OperationType {
     None = 0,
     NewEntry = 1,
     CopyStatement = 2,
@@ -454,8 +626,32 @@ pub enum Operation {
     SumOf = 9,
 }
 
-impl Operation {
-    pub fn apply_operation<V: EntryValue>(
+#[derive(Clone, Debug)]
+pub struct OperationCmd {
+    pub operation_type: OperationType,
+    pub statement_1_origin: Option<String>,
+    pub statement_1_name: Option<String>,
+    pub statement_2_origin: Option<String>,
+    pub statement_2_name: Option<String>,
+    pub statement_3_origin: Option<String>,
+    pub statement_3_name: Option<String>,
+    pub optional_entry: Option<(String, ScalarOrVec)>,
+    pub output_statement_name: String,
+}
+
+impl OperationCmd {
+    pub fn execute(
+        &self,
+        gadget_id: GadgetID,
+        in_statements: &HashMap<String, HashMap<String, Statement>>,
+        self_statements: &HashMap<String, Statement>,
+    ) -> Result<Statement, Error> {
+        Err("unimplemented".into())
+    }
+}
+
+impl OperationType {
+    pub fn apply_operation<V: HashableEntryValue>(
         &self,
         gadget_id: GadgetID,
         statement1: Option<&Statement>,
@@ -668,7 +864,7 @@ fn op_test() -> Result<(), Error> {
     let entry_statement6 = entry6.into();
 
     // Entry 2's value = entry 1's value + entry 6's value
-    let sum_of_statement = Operation::SumOf
+    let sum_of_statement = OperationType::SumOf
         .apply_operation(
             GadgetID::GOD,
             Some(&entry_statement2),
@@ -695,7 +891,7 @@ fn op_test() -> Result<(), Error> {
 
     // Copy statements and check for equality of entries.
     entries.into_iter().for_each(|statement| {
-        let copy = Operation::CopyStatement
+        let copy = OperationType::CopyStatement
             .apply_operation::<GoldilocksField>(GadgetID::GOD, Some(statement), None, None, None)
             .expect("This value should exist.");
         assert!(&copy == statement);
@@ -704,7 +900,7 @@ fn op_test() -> Result<(), Error> {
     // Equality checks
     println!(
         "{:?}",
-        Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
+        OperationType::EqualityFromEntries.apply_operation::<GoldilocksField>(
             GadgetID::GOD,
             Some(&entry_statement1),
             Some(&entry_statement2),
@@ -714,7 +910,7 @@ fn op_test() -> Result<(), Error> {
     );
     entries.into_iter().for_each(|statement| {
         assert!(
-            Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
+            OperationType::EqualityFromEntries.apply_operation::<GoldilocksField>(
                 GadgetID::GOD,
                 Some(statement),
                 Some(statement),
@@ -748,7 +944,7 @@ fn op_test() -> Result<(), Error> {
     //     })
     // );
     assert!(
-        Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
+        OperationType::EqualityFromEntries.apply_operation::<GoldilocksField>(
             GadgetID::GOD,
             Some(&entry_statement1),
             Some(&entry_statement2),
@@ -758,7 +954,7 @@ fn op_test() -> Result<(), Error> {
     );
 
     // Gt check
-    let gt_statement = Operation::GtFromEntries.apply_operation::<GoldilocksField>(
+    let gt_statement = OperationType::GtFromEntries.apply_operation::<GoldilocksField>(
         GadgetID::GOD,
         Some(&entry_statement2),
         Some(&entry_statement1),
@@ -780,7 +976,7 @@ fn op_test() -> Result<(), Error> {
     );
 
     // Eq transitivity check
-    let eq_statement1 = Operation::EqualityFromEntries
+    let eq_statement1 = OperationType::EqualityFromEntries
         .apply_operation::<GoldilocksField>(
             GadgetID::GOD,
             Some(&entry_statement4),
@@ -789,7 +985,7 @@ fn op_test() -> Result<(), Error> {
             None,
         )
         .unwrap();
-    let eq_statement2 = Operation::EqualityFromEntries
+    let eq_statement2 = OperationType::EqualityFromEntries
         .apply_operation::<GoldilocksField>(
             GadgetID::GOD,
             Some(&entry_statement1),
@@ -798,7 +994,7 @@ fn op_test() -> Result<(), Error> {
             None,
         )
         .unwrap();
-    let eq_statement3 = Operation::EqualityFromEntries
+    let eq_statement3 = OperationType::EqualityFromEntries
         .apply_operation::<GoldilocksField>(
             GadgetID::GOD,
             Some(&entry_statement4),
@@ -809,7 +1005,7 @@ fn op_test() -> Result<(), Error> {
         .unwrap();
 
     assert!(
-        Operation::TransitiveEqualityFromStatements.apply_operation::<GoldilocksField>(
+        OperationType::TransitiveEqualityFromStatements.apply_operation::<GoldilocksField>(
             GadgetID::GOD,
             Some(&eq_statement1),
             Some(&eq_statement2),
@@ -823,7 +1019,7 @@ fn op_test() -> Result<(), Error> {
     let mut expected_statement = unwrapped_gt_statement.clone();
     expected_statement.predicate = StatementPredicate::NotEqual;
     assert!(
-        Operation::GtToNonequality.apply_operation::<GoldilocksField>(
+        OperationType::GtToNonequality.apply_operation::<GoldilocksField>(
             GadgetID::GOD,
             Some(&unwrapped_gt_statement),
             None,
@@ -932,23 +1128,35 @@ fn god_pod_from_schnorr_test() -> Result<(), Error> {
             &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
         ],
         &vec![
-            (Operation::CopyStatement, Some(0), None, None, None),
-            (Operation::CopyStatement, Some(1), None, None, None),
-            (Operation::CopyStatement, Some(2), None, None, None),
-            (Operation::CopyStatement, Some(3), None, None, None),
-            (Operation::CopyStatement, Some(4), None, None, None),
-            (Operation::CopyStatement, Some(5), None, None, None),
-            (Operation::NewEntry, None, None, None, Some(&entry9)),
-            (Operation::EqualityFromEntries, Some(1), Some(4), None, None),
-            (Operation::EqualityFromEntries, Some(4), Some(8), None, None),
+            (OperationType::CopyStatement, Some(0), None, None, None),
+            (OperationType::CopyStatement, Some(1), None, None, None),
+            (OperationType::CopyStatement, Some(2), None, None, None),
+            (OperationType::CopyStatement, Some(3), None, None, None),
+            (OperationType::CopyStatement, Some(4), None, None, None),
+            (OperationType::CopyStatement, Some(5), None, None, None),
+            (OperationType::NewEntry, None, None, None, Some(&entry9)),
             (
-                Operation::NonequalityFromEntries,
+                OperationType::EqualityFromEntries,
+                Some(1),
+                Some(4),
+                None,
+                None,
+            ),
+            (
+                OperationType::EqualityFromEntries,
+                Some(4),
+                Some(8),
+                None,
+                None,
+            ),
+            (
+                OperationType::NonequalityFromEntries,
                 Some(0),
                 Some(1),
                 None,
                 None,
             ),
-            (Operation::GtFromEntries, Some(1), Some(0), None, None),
+            (OperationType::GtFromEntries, Some(1), Some(0), None, None),
         ],
     );
     println!("GODPOD1: {:?}", god_pod_1);
@@ -962,18 +1170,18 @@ fn god_pod_from_schnorr_test() -> Result<(), Error> {
             &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
         ],
         &vec![
-            (Operation::CopyStatement, Some(8), None, None, None),
-            (Operation::CopyStatement, Some(9), None, None, None),
-            (Operation::CopyStatement, Some(3), None, None, None),
-            (Operation::GtFromEntries, Some(6), Some(0), None, None),
+            (OperationType::CopyStatement, Some(8), None, None, None),
+            (OperationType::CopyStatement, Some(9), None, None, None),
+            (OperationType::CopyStatement, Some(3), None, None, None),
+            (OperationType::GtFromEntries, Some(6), Some(0), None, None),
             (
-                Operation::TransitiveEqualityFromStatements,
+                OperationType::TransitiveEqualityFromStatements,
                 Some(7),
                 Some(8),
                 None,
                 None,
             ),
-            (Operation::GtToNonequality, Some(10), None, None, None),
+            (OperationType::GtToNonequality, Some(10), None, None, None),
         ],
     );
     println!("GODPOD2: {:?}", god_pod_2);
@@ -1030,6 +1238,6 @@ fn god_pod_should_panic() {
             &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD2.clone()),
         ],
         // this Gt operation should fail because 36 is not gt 52
-        &vec![(Operation::GtFromEntries, Some(0), Some(1), None, None)],
+        &vec![(OperationType::GtFromEntries, Some(0), Some(1), None, None)],
     );
 }
