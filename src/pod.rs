@@ -304,137 +304,8 @@ impl POD {
         }
     }
 
-    // returns a map from input POD name to (map from statement name to statement)
-    // the inner statements have their old origin names and IDs are replaced with
-    // the new origin names as specified by inputs.origin_renaming_map
-    // and with new origin IDs which correspond to the lexicographic order of the new origin names
-    fn remap_origin_ids_by_name(
-        inputs: GPGInput,
-    ) -> Result<HashMap<String, HashMap<String, Statement>>, Error> {
-        let mut new_origin_name_list = Vec::new();
-        for (_, new_name) in inputs.origin_renaming_map.iter() {
-            new_origin_name_list.push(new_name.clone());
-        }
-        new_origin_name_list.sort();
-
-        let mut new_origin_name_to_id_map = HashMap::new();
-        for (idx, new_name) in new_origin_name_list.iter().enumerate() {
-            new_origin_name_to_id_map.insert(new_name.clone(), idx + 2); // 0 reserved for none, 1 reserved for _SELF
-        }
-
-        let mut statements_with_renamed_origins = HashMap::new();
-
-        for (pod_idx, (pod_name, pod)) in inputs.pods_list.iter().enumerate() {
-            let mut inner_map = HashMap::new();
-
-            for statement in pod.payload.statements_list.iter() {
-                let mut statement_with_remapped_origins = statement.clone();
-                let pod_name_clone = pod_name.clone();
-                // origin 1
-                let new_origin1_name = inputs
-                    .origin_renaming_map
-                    .get(&(pod_name.clone(), statement.origin1.origin_name.clone()));
-                match new_origin1_name {
-                    Some(new_origin1_name) => {
-                        let new_origin1_id = new_origin_name_to_id_map.get(new_origin1_name);
-                        match new_origin1_id {
-                            Some(&new_origin1_id) => {
-                                statement_with_remapped_origins.origin1 = Origin {
-                                    origin_id: GoldilocksField(new_origin1_id as u64),
-                                    origin_name: new_origin1_name.clone(),
-                                    gadget_id: statement.origin1.gadget_id,
-                                }
-                            }
-                            None => {
-                                return Err(("couldn't find id for new origin: ".to_string()
-                                    + new_origin1_name)
-                                    .into());
-                            }
-                        }
-                    }
-                    None => {
-                        return Err(("couldn't find new origin name for origin: ".to_string()
-                            + &pod_name.clone()
-                            + "."
-                            + &statement.origin1.origin_name.clone())
-                            .into())
-                    }
-                }
-                // origin 2
-                if let Some(old_origin2) = &statement.origin2 {
-                    let new_origin2_name = inputs
-                        .origin_renaming_map
-                        .get(&(pod_name.clone(), old_origin2.origin_name.clone()));
-                    match new_origin2_name {
-                        Some(new_origin2_name) => {
-                            let new_origin2_id = new_origin_name_to_id_map.get(new_origin2_name);
-                            match new_origin2_id {
-                                Some(&new_origin2_id) => {
-                                    statement_with_remapped_origins.origin2 = Some(Origin {
-                                        origin_id: GoldilocksField(new_origin2_id as u64),
-                                        origin_name: new_origin2_name.clone(),
-                                        gadget_id: old_origin2.gadget_id,
-                                    })
-                                }
-                                None => {
-                                    return Err(("couldn't find id for new origin: ".to_string()
-                                        + new_origin2_name)
-                                        .into());
-                                }
-                            }
-                        }
-                        None => {
-                            return Err(("couldn't find new origin name for origin: ".to_string()
-                                + &pod_name.clone()
-                                + "."
-                                + &old_origin2.origin_name.clone())
-                                .into())
-                        }
-                    }
-                }
-                // origin 3
-                if let Some(old_origin3) = &statement.origin3 {
-                    let new_origin3_name = inputs
-                        .origin_renaming_map
-                        .get(&(pod_name.clone(), old_origin3.origin_name.clone()));
-                    match new_origin3_name {
-                        Some(new_origin3_name) => {
-                            let new_origin3_id = new_origin_name_to_id_map.get(new_origin3_name);
-                            match new_origin3_id {
-                                Some(&new_origin3_id) => {
-                                    statement_with_remapped_origins.origin3 = Some(Origin {
-                                        origin_id: GoldilocksField(new_origin3_id as u64),
-                                        origin_name: new_origin3_name.clone(),
-                                        gadget_id: old_origin3.gadget_id,
-                                    })
-                                }
-                                None => {
-                                    return Err(("couldn't find id for new origin: ".to_string()
-                                        + new_origin3_name)
-                                        .into());
-                                }
-                            }
-                        }
-                        None => {
-                            return Err(("couldn't find new origin name for origin: ".to_string()
-                                + &pod_name.clone()
-                                + "."
-                                + &old_origin3.origin_name.clone())
-                                .into())
-                        }
-                    }
-                }
-
-                inner_map.insert(statement.name.clone(), statement_with_remapped_origins);
-            }
-            statements_with_renamed_origins.insert(pod_name.clone(), inner_map);
-        }
-
-        Ok(statements_with_renamed_origins)
-    }
-
     pub fn execute_oracle_gadget(input: GPGInput, cmds: &Vec<OperationCmd>) -> Result<Self, Error> {
-        let mut statements = POD::remap_origin_ids_by_name(input);
+        let mut statements = input.remap_origin_ids_by_name();
         match &mut statements {
             Ok(statements) => {
                 statements.insert("_SELF".to_string(), HashMap::new());
@@ -500,6 +371,134 @@ impl GPGInput {
             pods_list: pods_and_names_list.clone(),
             origin_renaming_map: origin_renaming_map.clone(),
         };
+    }
+
+    // returns a map from input POD name to (map from statement name to statement)
+    // the inner statements have their old origin names and IDs are replaced with
+    // the new origin names as specified by inputs.origin_renaming_map
+    // and with new origin IDs which correspond to the lexicographic order of the new origin names
+    fn remap_origin_ids_by_name(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, Statement>>, Error> {
+        let mut new_origin_name_list = Vec::new();
+        for (_, new_name) in self.origin_renaming_map.iter() {
+            new_origin_name_list.push(new_name.clone());
+        }
+        new_origin_name_list.sort();
+
+        let mut new_origin_name_to_id_map = HashMap::new();
+        for (idx, new_name) in new_origin_name_list.iter().enumerate() {
+            new_origin_name_to_id_map.insert(new_name.clone(), idx + 2); // 0 reserved for none, 1 reserved for _SELF
+        }
+
+        let mut statements_with_renamed_origins = HashMap::new();
+
+        for (_, (pod_name, pod)) in self.pods_list.iter().enumerate() {
+            let mut inner_map = HashMap::new();
+
+            for statement in pod.payload.statements_list.iter() {
+                let mut statement_with_remapped_origins = statement.clone();
+                // origin 1
+                let new_origin1_name = self
+                    .origin_renaming_map
+                    .get(&(pod_name.clone(), statement.origin1.origin_name.clone()));
+                match new_origin1_name {
+                    Some(new_origin1_name) => {
+                        let new_origin1_id = new_origin_name_to_id_map.get(new_origin1_name);
+                        match new_origin1_id {
+                            Some(&new_origin1_id) => {
+                                statement_with_remapped_origins.origin1 = Origin {
+                                    origin_id: GoldilocksField(new_origin1_id as u64),
+                                    origin_name: new_origin1_name.clone(),
+                                    gadget_id: statement.origin1.gadget_id,
+                                }
+                            }
+                            None => {
+                                return Err(("couldn't find id for new origin: ".to_string()
+                                    + new_origin1_name)
+                                    .into());
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(("couldn't find new origin name for origin: ".to_string()
+                            + &pod_name.clone()
+                            + "."
+                            + &statement.origin1.origin_name.clone())
+                            .into())
+                    }
+                }
+                // origin 2
+                if let Some(old_origin2) = &statement.origin2 {
+                    let new_origin2_name = self
+                        .origin_renaming_map
+                        .get(&(pod_name.clone(), old_origin2.origin_name.clone()));
+                    match new_origin2_name {
+                        Some(new_origin2_name) => {
+                            let new_origin2_id = new_origin_name_to_id_map.get(new_origin2_name);
+                            match new_origin2_id {
+                                Some(&new_origin2_id) => {
+                                    statement_with_remapped_origins.origin2 = Some(Origin {
+                                        origin_id: GoldilocksField(new_origin2_id as u64),
+                                        origin_name: new_origin2_name.clone(),
+                                        gadget_id: old_origin2.gadget_id,
+                                    })
+                                }
+                                None => {
+                                    return Err(("couldn't find id for new origin: ".to_string()
+                                        + new_origin2_name)
+                                        .into());
+                                }
+                            }
+                        }
+                        None => {
+                            return Err(("couldn't find new origin name for origin: ".to_string()
+                                + &pod_name.clone()
+                                + "."
+                                + &old_origin2.origin_name.clone())
+                                .into())
+                        }
+                    }
+                }
+                // origin 3
+                if let Some(old_origin3) = &statement.origin3 {
+                    let new_origin3_name = self
+                        .origin_renaming_map
+                        .get(&(pod_name.clone(), old_origin3.origin_name.clone()));
+                    match new_origin3_name {
+                        Some(new_origin3_name) => {
+                            let new_origin3_id = new_origin_name_to_id_map.get(new_origin3_name);
+                            match new_origin3_id {
+                                Some(&new_origin3_id) => {
+                                    statement_with_remapped_origins.origin3 = Some(Origin {
+                                        origin_id: GoldilocksField(new_origin3_id as u64),
+                                        origin_name: new_origin3_name.clone(),
+                                        gadget_id: old_origin3.gadget_id,
+                                    })
+                                }
+                                None => {
+                                    return Err(("couldn't find id for new origin: ".to_string()
+                                        + new_origin3_name)
+                                        .into());
+                                }
+                            }
+                        }
+                        None => {
+                            return Err(("couldn't find new origin name for origin: ".to_string()
+                                + &pod_name.clone()
+                                + "."
+                                + &old_origin3.origin_name.clone())
+                                .into())
+                        }
+                    }
+                }
+
+                inner_map.insert(statement.name.clone(), statement_with_remapped_origins);
+            }
+            statements_with_renamed_origins.insert(pod_name.clone(), inner_map);
+        }
+
+        Ok(statements_with_renamed_origins)
     }
 }
 
