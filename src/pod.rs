@@ -304,6 +304,10 @@ impl POD {
         }
     }
 
+    // returns a map from input POD name to (map from statement name to statement)
+    // the inner statements have their old origin names and IDs are replaced with
+    // the new origin names as specified by inputs.origin_renaming_map
+    // and with new origin IDs which correspond to the lexicographic order of the new origin names
     fn remap_origin_ids_by_name(
         inputs: GPGInput,
     ) -> Result<HashMap<String, HashMap<String, Statement>>, Error> {
@@ -476,7 +480,6 @@ impl POD {
 
 pub struct GPGInput {
     pub pods_list: Vec<(String, POD)>, // ORDERED list of pods, ordered by names
-    pub pods_map: HashMap<String, POD>, // map from pod name to pod
 
     // map from (pod name, old origin name) to new origin name
     pub origin_renaming_map: HashMap<(String, String), String>,
@@ -495,7 +498,6 @@ impl GPGInput {
 
         return Self {
             pods_list: pods_and_names_list.clone(),
-            pods_map: named_pods.clone(),
             origin_renaming_map: origin_renaming_map.clone(),
         };
     }
