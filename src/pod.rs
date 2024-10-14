@@ -314,7 +314,10 @@ impl POD {
         }
     }
 
-    pub fn execute_oracle_gadget(input: GPGInput, cmds: &Vec<OperationCmd>) -> Result<Self, Error> {
+    pub fn execute_oracle_gadget(
+        input: &GPGInput,
+        cmds: &Vec<OperationCmd>,
+    ) -> Result<Self, Error> {
         let mut statements = input.remap_origin_ids_by_name();
         match &mut statements {
             Ok(statements) => {
@@ -329,6 +332,7 @@ impl POD {
                                 .insert(cmd.output_statement_name.clone(), new_statement);
                         }
                         None => {
+                            print!("{:?}", cmd);
                             return Err("operation failed to execute".into());
                         }
                     }
@@ -359,6 +363,7 @@ impl POD {
 
 // Operations
 
+#[derive(Clone, Debug)]
 pub struct GPGInput {
     pub pods_list: Vec<(String, POD)>, // ORDERED list of pods, ordered by names
 
@@ -522,18 +527,18 @@ pub enum OperationType {
     GtFromEntries = 5,
     TransitiveEqualityFromStatements = 6,
     GtToNonequality = 7,
-    Contains = 8,
+    ContainsFromEntries = 8,
     SumOf = 9,
 }
 
 #[derive(Clone, Debug)]
 pub struct OperationCmd {
     pub operation_type: OperationType,
-    pub statement_1_origin: Option<String>,
+    pub statement_1_parent: Option<String>,
     pub statement_1_name: Option<String>,
-    pub statement_2_origin: Option<String>,
+    pub statement_2_parent: Option<String>,
     pub statement_2_name: Option<String>,
-    pub statement_3_origin: Option<String>,
+    pub statement_3_parent: Option<String>,
     pub statement_3_name: Option<String>,
     pub optional_entry: Option<Entry>,
     pub output_statement_name: String,
@@ -564,18 +569,18 @@ impl OperationCmd {
     ) -> Option<Statement> {
         let statement1 = OperationCmd::get_statement_with_origin_and_name(
             statements,
+            self.statement_1_parent.clone(),
             self.statement_1_name.clone(),
-            self.statement_1_origin.clone(),
         );
         let statement2 = OperationCmd::get_statement_with_origin_and_name(
             statements,
+            self.statement_2_parent.clone(),
             self.statement_2_name.clone(),
-            self.statement_2_origin.clone(),
         );
         let statement3 = OperationCmd::get_statement_with_origin_and_name(
             statements,
+            self.statement_3_parent.clone(),
             self.statement_3_name.clone(),
-            self.statement_3_origin.clone(),
         );
         let optional_entry = self.optional_entry.clone();
 
@@ -759,7 +764,7 @@ impl OperationType {
                 }),
                 _ => None,
             },
-            (OperationType::Contains, Some(left_entry), Some(right_entry), _, _) => {
+            (OperationType::ContainsFromEntries, Some(left_entry), Some(right_entry), _, _) => {
                 match (
                     left_entry.predicate,
                     left_entry.optional_value,
@@ -1032,172 +1037,309 @@ fn op_test() -> Result<(), Error> {
     Ok(())
 }
 
-// #[test]
-// fn schnorr_pod_test() -> Result<(), Error> {
-//     // Start with some values.
-//     let scalar1 = GoldilocksField(36);
-//     let scalar2 = GoldilocksField(52);
-//     let vector_value = vec![scalar1, scalar2];
+#[test]
+fn schnorr_pod_test() -> Result<(), Error> {
+    // Start with some values.
+    let scalar1 = GoldilocksField(36);
+    let scalar2 = GoldilocksField(52);
+    let vector_value = vec![scalar1, scalar2];
 
-//     let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
-//     let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
-//     let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
+    let entry1 = Entry::newFromScalar("some key".to_string(), scalar1);
+    let entry2 = Entry::newFromScalar("some other key".to_string(), scalar2);
+    let entry3 = Entry::newFromVec("vector entry".to_string(), vector_value.clone());
 
-//     let schnorrPOD1 = SchnorrPOD::gadget(
-//         &vec![entry1.clone(), entry2.clone()],
-//         &SchnorrSecretKey { sk: 25 },
-//     );
+    let schnorrPOD1 = POD::execute_schnorr_gadget(
+        &vec![entry1.clone(), entry2.clone()],
+        &SchnorrSecretKey { sk: 25 },
+    );
 
-//     let schnorrPOD2 = SchnorrPOD::gadget(
-//         &vec![entry2.clone(), entry3.clone()],
-//         &SchnorrSecretKey { sk: 42 },
-//     );
+    let schnorrPOD2 = POD::execute_schnorr_gadget(
+        &vec![entry2.clone(), entry3.clone()],
+        &SchnorrSecretKey { sk: 42 },
+    );
 
-//     let schnorrPOD3 = SchnorrPOD::gadget(&vec![entry1.clone()], &SchnorrSecretKey { sk: 25 });
+    assert!(schnorrPOD1.verify()? == true);
+    assert!(schnorrPOD2.verify()? == true);
 
-//     // println!(
-//     //     "verify schnorrpod1: {:?}",
-//     //     schnorrPOD1.clone().payload.to_field_vec()
-//     // );
-//     // println!("verify schnorrpod2: {:?}", schnorrPOD2.verify());
+    let mut schnorrPOD3 =
+        POD::execute_schnorr_gadget(&vec![entry1.clone()], &SchnorrSecretKey { sk: 25 });
 
-//     assert!(schnorrPOD1.verify()? == true);
-//     assert!(schnorrPOD2.verify()? == true);
+    // modify the internal value of the valueOf statement in schnorrPOD3
+    let stmt_in_map = schnorrPOD3.payload.statements_map.get_mut("entry-some key");
+    stmt_in_map.unwrap().optional_value = Some(ScalarOrVec::Scalar(GoldilocksField(37)));
+    schnorrPOD3.payload.statements_list[1].1.optional_value =
+        Some(ScalarOrVec::Scalar(GoldilocksField(37)));
 
-//     // // ZK verification of SchnorrPOD 3.
-//     // let (builder, targets) = pod2_circuit(1, 2, 0, 0)?;
+    // now signature shouldn't verify
+    assert!(schnorrPOD3.verify()? == false);
 
-//     // // Assign witnesses
-//     // const D: usize = 2;
-//     // type C = PoseidonGoldilocksConfig;
-//     // type F = <C as GenericConfig<D>>::F;
-//     // let mut pw: PartialWitness<F> = PartialWitness::new();
-//     // pw.set_target(targets.input_is_schnorr[0], GoldilocksField(1))?;
-//     // pw.set_target(targets.input_is_gpg[0], GoldilocksField::ZERO)?;
-//     // pw.set_target(
-//     //     targets.input_payload_hash[0],
-//     //     schnorrPOD3.payload.hash_payload(),
-//     // )?;
-//     // pw.set_target(targets.pk_index[0], GoldilocksField(1))?;
-//     // targets.input_proof[0].set_witness(&mut pw, &schnorrPOD3.proof)?;
-//     // targets.input_entries[0][0].set_witness(&mut pw, &schnorrPOD3.payload[0])?;
-//     // targets.input_entries[0][1].set_witness(&mut pw, &schnorrPOD3.payload[1])?;
-//     // let data = builder.build::<C>();
-//     // let proof = data.prove(pw)?;
+    // // ZK verification of SchnorrPOD 3.
+    // let (builder, targets) = pod2_circuit(1, 2, 0, 0)?;
 
-//     Ok(())
-// }
+    // // Assign witnesses
+    // const D: usize = 2;
+    // type C = PoseidonGoldilocksConfig;
+    // type F = <C as GenericConfig<D>>::F;
+    // let mut pw: PartialWitness<F> = PartialWitness::new();
+    // pw.set_target(targets.input_is_schnorr[0], GoldilocksField(1))?;
+    // pw.set_target(targets.input_is_gpg[0], GoldilocksField::ZERO)?;
+    // pw.set_target(
+    //     targets.input_payload_hash[0],
+    //     schnorrPOD3.payload.hash_payload(),
+    // )?;
+    // pw.set_target(targets.pk_index[0], GoldilocksField(1))?;
+    // targets.input_proof[0].set_witness(&mut pw, &schnorrPOD3.proof)?;
+    // targets.input_entries[0][0].set_witness(&mut pw, &schnorrPOD3.payload[0])?;
+    // targets.input_entries[0][1].set_witness(&mut pw, &schnorrPOD3.payload[1])?;
+    // let data = builder.build::<C>();
+    // let proof = data.prove(pw)?;
 
-// #[test]
-// fn god_pod_from_schnorr_test() -> Result<(), Error> {
-//     // Start with some values.
-//     let scalar1 = GoldilocksField(36);
-//     let scalar2 = GoldilocksField(52);
-//     let scalar3 = GoldilocksField(90);
-//     let vector_value = vec![scalar1, scalar2];
+    Ok(())
+}
 
-//     // make entries
-//     let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
-//     let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
-//     let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
-//     let entry4 = Entry::new("new key", ScalarOrVec::Scalar(scalar2));
-//     let entry5 = Entry::new("foo", ScalarOrVec::Scalar(GoldilocksField(100)));
-//     let entry6 = Entry::new("baz", ScalarOrVec::Scalar(GoldilocksField(120)));
-//     let entry7 = Entry::new("yum", ScalarOrVec::Scalar(scalar2));
-//     let entry9 = Entry::new("godpod introduced entry key", ScalarOrVec::Scalar(scalar3));
+#[test]
+fn god_pod_from_schnorr_test() -> Result<(), Error> {
+    println!("god_pod_from_schnorr_test");
+    // Start with some values.
+    let scalar1 = GoldilocksField(36);
+    let scalar2 = GoldilocksField(52);
+    let scalar3 = GoldilocksField(90);
+    let vector_value = vec![scalar1, scalar2];
 
-//     // three schnorr pods
-//     let schnorrPOD1 = SchnorrPOD::gadget(
-//         &vec![entry1.clone(), entry2.clone()],
-//         &SchnorrSecretKey { sk: 25 },
-//     );
+    // make entries
+    let entry1 = Entry::newFromScalar("some key".to_string(), scalar1);
+    let entry2 = Entry::newFromScalar("some other key".to_string(), scalar2);
+    let entry3 = Entry::newFromVec("vector entry".to_string(), vector_value.clone());
+    let entry4 = Entry::newFromScalar("new key".to_string(), scalar2);
+    let entry5 = Entry::newFromScalar("foo".to_string(), GoldilocksField(100));
+    let entry6 = Entry::newFromScalar("baz".to_string(), GoldilocksField(120));
+    let entry7 = Entry::newFromScalar("yum".to_string(), scalar2);
+    let entry9 = Entry::newFromScalar("godpod introduced entry key".to_string(), scalar3);
 
-//     let schnorrPOD2 = SchnorrPOD::gadget(
-//         &vec![entry3.clone(), entry4.clone()],
-//         &SchnorrSecretKey { sk: 42 },
-//     );
+    // three schnorr pods
+    let schnorrPOD1 = POD::execute_schnorr_gadget(
+        &vec![entry1.clone(), entry2.clone()],
+        &SchnorrSecretKey { sk: 25 },
+    );
 
-//     let schnorrPOD3 = SchnorrPOD::gadget(
-//         &vec![entry5.clone(), entry6.clone(), entry7.clone()],
-//         &SchnorrSecretKey { sk: 83 },
-//     );
+    let schnorrPOD2 = POD::execute_schnorr_gadget(
+        &vec![entry3.clone(), entry4.clone()],
+        &SchnorrSecretKey { sk: 42 },
+    );
 
-//     // make a GODPOD using from_pods called on the two schnorr PODs
-//     let god_pod_1 = GODPOD::gadget(
-//         &vec![
-//             &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD1.clone()),
-//             &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD2.clone()),
-//             &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
-//         ],
-//         &vec![
-//             (OperationType::CopyStatement, Some(0), None, None, None),
-//             (OperationType::CopyStatement, Some(1), None, None, None),
-//             (OperationType::CopyStatement, Some(2), None, None, None),
-//             (OperationType::CopyStatement, Some(3), None, None, None),
-//             (OperationType::CopyStatement, Some(4), None, None, None),
-//             (OperationType::CopyStatement, Some(5), None, None, None),
-//             (OperationType::NewEntry, None, None, None, Some(&entry9)),
-//             (
-//                 OperationType::EqualityFromEntries,
-//                 Some(1),
-//                 Some(4),
-//                 None,
-//                 None,
-//             ),
-//             (
-//                 OperationType::EqualityFromEntries,
-//                 Some(4),
-//                 Some(8),
-//                 None,
-//                 None,
-//             ),
-//             (
-//                 OperationType::NonequalityFromEntries,
-//                 Some(0),
-//                 Some(1),
-//                 None,
-//                 None,
-//             ),
-//             (OperationType::GtFromEntries, Some(1), Some(0), None, None),
-//         ],
-//     );
-//     println!("GODPOD1: {:?}", god_pod_1);
-//     assert!(god_pod_1.verify()? == true);
+    let schnorrPOD3 = POD::execute_schnorr_gadget(
+        &vec![entry5.clone(), entry6.clone(), entry7.clone()],
+        &SchnorrSecretKey { sk: 83 },
+    );
 
-//     // another GODPOD from the first GODPOD and another schnorr POD
+    // make an OraclePOD using from_pods called on the two schnorr PODs
 
-//     let god_pod_2 = GODPOD::gadget(
-//         &vec![
-//             &SchnorrOrGODPOD::GODPOD(god_pod_1.clone()),
-//             &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
-//         ],
-//         &vec![
-//             (OperationType::CopyStatement, Some(8), None, None, None),
-//             (OperationType::CopyStatement, Some(9), None, None, None),
-//             (OperationType::CopyStatement, Some(3), None, None, None),
-//             (OperationType::GtFromEntries, Some(6), Some(0), None, None),
-//             (
-//                 OperationType::TransitiveEqualityFromStatements,
-//                 Some(7),
-//                 Some(8),
-//                 None,
-//                 None,
-//             ),
-//             (OperationType::GtToNonequality, Some(10), None, None, None),
-//         ],
-//     );
-//     println!("GODPOD2: {:?}", god_pod_2);
+    // first make the GPG input
 
-//     // println!(
-//     //     "verify schnorrpod1: {:?}",
-//     //     schnorrPOD1.clone().payload.to_field_vec()
-//     // );
-//     // println!("verify schnorrpod2: {:?}", schnorrPOD2.verify());
+    // make a map of named POD inputs
+    let mut named_input_pods = HashMap::new();
+    named_input_pods.insert("schnorrPOD1".to_string(), schnorrPOD1.clone());
+    named_input_pods.insert("schnorrPOD2".to_string(), schnorrPOD2.clone());
+    named_input_pods.insert("schnorrPOD3".to_string(), schnorrPOD3.clone());
 
-//     assert!(god_pod_2.verify()? == true);
+    // make a map of (pod name, old origin name) to new origin name
+    let mut origin_renaming_map = HashMap::new();
+    origin_renaming_map.insert(
+        ("schnorrPOD1".to_string(), "_SELF".to_string()),
+        "schnorrPOD1".to_string(),
+    );
+    origin_renaming_map.insert(
+        ("schnorrPOD2".to_string(), "_SELF".to_string()),
+        "schnorrPOD2".to_string(),
+    );
 
-//     Ok(())
-// }
+    let gpg_input = GPGInput::new(named_input_pods, origin_renaming_map);
+
+    // make a list of the operations we want to call
+    let ops = vec![
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD1".to_string()),
+            statement_1_name: Some("entry-some key".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD1-some key".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD1".to_string()),
+            statement_1_name: Some("entry-some other key".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD1-some other key".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD1".to_string()),
+            statement_1_name: Some("entry-_signer".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD1-signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD2".to_string()),
+            statement_1_name: Some("entry-vector entry".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD2-vec-entry".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD2".to_string()),
+            statement_1_name: Some("entry-new key".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD2-new key".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD2".to_string()),
+            statement_1_name: Some("entry-_signer".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD2-signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD3".to_string()),
+            statement_1_name: Some("entry-yum".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD3-yum".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("schnorrPOD1".to_string()),
+            statement_1_name: Some("entry-some other key".to_string()),
+            statement_2_parent: Some("schnorrPOD2".to_string()),
+            statement_2_name: Some("entry-new key".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "eq1".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::ContainsFromEntries,
+            statement_1_parent: Some("_SELF".to_string()),
+            statement_1_name: Some("schnorrPOD2-vec-entry".to_string()),
+            statement_2_parent: Some("schnorrPOD1".to_string()),
+            statement_2_name: Some("entry-some key".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "contains test".to_string(),
+        },
+    ];
+
+    let oracle_pod = POD::execute_oracle_gadget(&gpg_input, &ops);
+    let statements = &oracle_pod.unwrap();
+    for statement in statements.payload.statements_list.iter() {
+        println!("statement: {:?}", statement);
+    }
+    // assert!(oracle_pod.unwrap().verify()? == true);
+
+    // let god_pod_1 = GODPOD::gadget(
+    //     &vec![
+    //         &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD1.clone()),
+    //         &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD2.clone()),
+    //         &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
+    //     ],
+    //     &vec![
+    //         (OperationType::CopyStatement, Some(0), None, None, None),
+    //         (OperationType::CopyStatement, Some(1), None, None, None),
+    //         (OperationType::CopyStatement, Some(2), None, None, None),
+    //         (OperationType::CopyStatement, Some(3), None, None, None),
+    //         (OperationType::CopyStatement, Some(4), None, None, None),
+    //         (OperationType::CopyStatement, Some(5), None, None, None),
+    //         (OperationType::NewEntry, None, None, None, Some(&entry9)),
+    //         (
+    //             OperationType::EqualityFromEntries,
+    //             Some(1),
+    //             Some(4),
+    //             None,
+    //             None,
+    //         ),
+    //         (
+    //             OperationType::EqualityFromEntries,
+    //             Some(4),
+    //             Some(8),
+    //             None,
+    //             None,
+    //         ),
+    //         (
+    //             OperationType::NonequalityFromEntries,
+    //             Some(0),
+    //             Some(1),
+    //             None,
+    //             None,
+    //         ),
+    //         (OperationType::GtFromEntries, Some(1), Some(0), None, None),
+    //     ],
+    // );
+    // println!("GODPOD1: {:?}", god_pod_1);
+    // assert!(god_pod_1.verify()? == true);
+
+    // // another GODPOD from the first GODPOD and another schnorr POD
+
+    // let god_pod_2 = GODPOD::gadget(
+    //     &vec![
+    //         &SchnorrOrGODPOD::GODPOD(god_pod_1.clone()),
+    //         &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
+    //     ],
+    //     &vec![
+    //         (OperationType::CopyStatement, Some(8), None, None, None),
+    //         (OperationType::CopyStatement, Some(9), None, None, None),
+    //         (OperationType::CopyStatement, Some(3), None, None, None),
+    //         (OperationType::GtFromEntries, Some(6), Some(0), None, None),
+    //         (
+    //             OperationType::TransitiveEqualityFromStatements,
+    //             Some(7),
+    //             Some(8),
+    //             None,
+    //             None,
+    //         ),
+    //         (OperationType::GtToNonequality, Some(10), None, None, None),
+    //     ],
+    // );
+    // println!("GODPOD2: {:?}", god_pod_2);
+
+    // // println!(
+    // //     "verify schnorrpod1: {:?}",
+    // //     schnorrPOD1.clone().payload.to_field_vec()
+    // // );
+    // // println!("verify schnorrpod2: {:?}", schnorrPOD2.verify());
+
+    // assert!(god_pod_2.verify()? == true);
+
+    Ok(())
+}
 
 // #[test]
 // #[should_panic]
@@ -1218,17 +1360,17 @@ fn op_test() -> Result<(), Error> {
 //     let entry9 = Entry::new("godpod introduced entry key", ScalarOrVec::Scalar(scalar3));
 
 //     // three schnorr pods
-//     let schnorrPOD1 = SchnorrPOD::gadget(
+//     let schnorrPOD1 = POD::execute_schnorr_gadget(
 //         &vec![entry1.clone(), entry2.clone()],
 //         &SchnorrSecretKey { sk: 25 },
 //     );
 
-//     let schnorrPOD2 = SchnorrPOD::gadget(
+//     let schnorrPOD2 = POD::execute_schnorr_gadget(
 //         &vec![entry3.clone(), entry4.clone()],
 //         &SchnorrSecretKey { sk: 42 },
 //     );
 
-//     let schnorrPOD3 = SchnorrPOD::gadget(
+//     let schnorrPOD3 = POD::execute_schnorr_gadget(
 //         &vec![entry5.clone(), entry6.clone()],
 //         &SchnorrSecretKey { sk: 83 },
 //     );
