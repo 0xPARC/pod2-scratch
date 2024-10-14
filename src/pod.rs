@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 //use circuit::pod2_circuit;
@@ -22,117 +21,19 @@ mod util;
 
 pub(crate) type Error = Box<dyn std::error::Error>;
 
-pub trait HashablePayload: Clone + PartialEq {
-    fn to_field_vec(&self) -> Vec<GoldilocksField>;
-
-    fn hash_payload(&self) -> GoldilocksField {
-        let ins = self.to_field_vec();
-        PoseidonHash::hash_no_pad(&ins).to_vec()[0]
-    }
-}
-
-impl<V: EntryValue> HashablePayload for Vec<Entry<V>> {
-    fn to_field_vec(&self) -> Vec<GoldilocksField> {
-        // let mut sorted_by_key_name = self.clone();
-        // sorted_by_key_name.sort_by(|a, b| a.key_name.cmp(&b.key_name));
-        let mut ins = Vec::new();
-        // sorted_by_key_name.iter().for_each(|entry| {
-        //     ins.push(entry.key_hash);
-        //     ins.push(entry.value_hash);
-        // });
-        self.iter().for_each(|entry| {
-            ins.push(entry.key_hash);
-            ins.push(entry.value_hash);
-        });
-        ins
-    }
-}
-
-// TODO
-impl HashablePayload for Vec<Statement> {
-    fn to_field_vec(&self) -> Vec<GoldilocksField> {
-        self.iter()
-            .map(|statement| {
-                [
-                    vec![
-                        GoldilocksField(statement.predicate as u64),
-                        statement.origin1.origin_id,
-                        GoldilocksField(statement.origin1.gadget_id as u64),
-                        hash_string_to_field(&statement.key1),
-                    ],
-                    match statement.origin2 {
-                        Some(ro) => vec![ro.origin_id, GoldilocksField(ro.gadget_id as u64)],
-                        _ => vec![GoldilocksField(0), GoldilocksField(0)],
-                    },
-                    vec![
-                        match &statement.key2 {
-                            Some(rkn) => hash_string_to_field(&rkn),
-                            _ => GoldilocksField::ZERO,
-                        },
-                        match statement.optional_value {
-                            Some(x) => x,
-                            _ => GoldilocksField::ZERO,
-                        },
-                    ],
-                ]
-                .concat()
-            })
-            .collect::<Vec<Vec<GoldilocksField>>>()
-            .concat()
-    }
-}
-
-pub trait ProofOf<Payload>: Clone {
-    fn verify(&self, payload: &Payload) -> Result<bool, Error>;
-}
-
-// verify schnorr POD
-impl ProofOf<Vec<Entry<ScalarOrVec>>> for SchnorrSignature {
-    fn verify(&self, payload: &Vec<Entry<ScalarOrVec>>) -> Result<bool, Error> {
-        let payload_hash = payload.hash_payload();
-        let payload_hash_vec = vec![payload_hash];
-        let protocol = SchnorrSigner::new();
-        let wrapped_pk = payload
-            .iter()
-            .filter(|entry| entry.key_name == "_signer")
-            .collect::<Vec<&Entry<ScalarOrVec>>>();
-        if wrapped_pk.len() == 0 {
-            return Err("No signer found in payload".into());
-        }
-
-        let pk = match wrapped_pk[0].value {
-            ScalarOrVec::Vector(_) => Err(Error::from("Signer is a vector")),
-            ScalarOrVec::Scalar(s) => Ok(s),
-        }?;
-        Ok(protocol.verify(&self, &payload_hash_vec, &SchnorrPublicKey { pk }))
-    }
-}
-
-// verify GODPOD
-impl ProofOf<Vec<Statement>> for SchnorrSignature {
-    fn verify(&self, payload: &Vec<Statement>) -> Result<bool, Error> {
-        let payload_hash = payload.hash_payload();
-        let payload_hash_vec = vec![payload_hash];
-        let protocol = SchnorrSigner::new();
-        Ok(protocol.verify(
-            &self,
-            &payload_hash_vec,
-            &protocol.keygen(&SchnorrSecretKey { sk: 0 }), // hardcoded secret key
-        ))
-    }
-}
-
-pub trait EntryValue: Clone + PartialEq {
+// EntryValue trait, and ScalarOrVec type which implements it.
+// This is a field element or array of field elements.
+pub trait HashableEntryValue: Clone + PartialEq {
     fn hash_or_value(&self) -> GoldilocksField;
 }
 
-impl EntryValue for GoldilocksField {
+impl HashableEntryValue for GoldilocksField {
     fn hash_or_value(&self) -> GoldilocksField {
         *self
     }
 }
 
-impl EntryValue for Vec<GoldilocksField> {
+impl HashableEntryValue for Vec<GoldilocksField> {
     fn hash_or_value(&self) -> GoldilocksField {
         PoseidonHash::hash_no_pad(self).to_vec()[0]
     }
@@ -144,7 +45,7 @@ pub enum ScalarOrVec {
     Vector(Vec<GoldilocksField>),
 }
 
-impl EntryValue for ScalarOrVec {
+impl HashableEntryValue for ScalarOrVec {
     fn hash_or_value(&self) -> GoldilocksField {
         match self {
             Self::Scalar(s) => s.hash_or_value(),
@@ -153,45 +54,49 @@ impl EntryValue for ScalarOrVec {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
-#[repr(usize)]
-pub enum GadgetID {
-    NONE = 0,
-    SCHNORR16 = 1,
-    GOD = 2,
+// An Entry, which is just a key-value pair.
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub key: String,
+    pub value: ScalarOrVec,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+impl Entry {
+    fn newFromScalar(key: String, value: GoldilocksField) -> Self {
+        Entry {
+            key,
+            value: ScalarOrVec::Scalar(value),
+        }
+    }
+
+    fn newFromVec(key: String, value: Vec<GoldilocksField>) -> Self {
+        Entry {
+            key,
+            value: ScalarOrVec::Vector(value),
+        }
+    }
+}
+
+// An Origin, which represents a reference to an ancestor POD.
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Origin {
     pub origin_id: GoldilocksField, // reserve 0 for NONE, 1 for SELF
+    pub origin_name: String,
     pub gadget_id: GadgetID, // if origin_id is SELF, this is none; otherwise, it's the gadget_id
 }
 
 impl Origin {
     pub const NONE: Self = Origin {
         origin_id: GoldilocksField::ZERO,
+        origin_name: String::new(),
         gadget_id: GadgetID::NONE,
     };
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Entry<V: EntryValue> {
-    pub key_name: String,
-    pub key_hash: GoldilocksField,
-    pub value_hash: GoldilocksField,
-    pub value: V,
-}
-
-impl<V: EntryValue> Entry<V> {
-    fn new(key_name: &str, value: V) -> Self {
-        Entry {
-            key_name: key_name.to_string(),
-            key_hash: hash_string_to_field(key_name),
-            value_hash: value.hash_or_value(),
-            value,
-        }
-    }
-}
+// A Statement, which is a claim about one or more entries.
+// Entries are ValueOf statements.
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u64)]
@@ -205,6 +110,18 @@ pub enum StatementPredicate {
     SumOf = 6,
 }
 
+pub fn predicate_name(predicate: StatementPredicate) -> String {
+    match predicate {
+        StatementPredicate::None => "NONE".to_string(),
+        StatementPredicate::ValueOf => "VALUEOF".to_string(),
+        StatementPredicate::Equal => "EQUAL".to_string(),
+        StatementPredicate::NotEqual => "NOTEQUAL".to_string(),
+        StatementPredicate::Gt => "GT".to_string(),
+        StatementPredicate::Contains => "CONTAINS".to_string(),
+        StatementPredicate::SumOf => "SUMOF".to_string(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Statement {
     pub predicate: StatementPredicate,
@@ -214,234 +131,409 @@ pub struct Statement {
     pub key2: Option<String>,
     pub origin3: Option<Origin>,
     pub key3: Option<String>,
-    pub optional_value: Option<GoldilocksField>, // todo: figure out how to allow this to be any EntryValue
+    pub optional_value: Option<ScalarOrVec>, // todo: figure out how to allow this to be any EntryValue
 }
 
-pub fn entry_to_statement<V: EntryValue>(entry: &Entry<V>, gadget_id: GadgetID) -> Statement {
-    Statement {
-        predicate: StatementPredicate::ValueOf,
-        origin1: Origin {
-            origin_id: GoldilocksField(1),
-            gadget_id,
-        },
-        key1: entry.key_name.clone(),
-        origin2: None,
-        key2: None,
-        origin3: None,
-        key3: None,
-        optional_value: Some(entry.value.hash_or_value()),
+impl Statement {
+    pub fn from_entry(entry: &Entry, this_gadget_id: GadgetID) -> Self {
+        Statement {
+            predicate: StatementPredicate::ValueOf,
+            origin1: Origin {
+                origin_id: GoldilocksField(1),
+                origin_name: "_SELF".to_string(),
+                gadget_id: this_gadget_id,
+            },
+            key1: entry.key.to_string(),
+            origin2: None,
+            key2: None,
+            origin3: None,
+            key3: None,
+            optional_value: Some(entry.value.clone()),
+        }
     }
 }
 
-impl<V: EntryValue> Into<Statement> for Entry<V> {
-    fn into(self) -> Statement {
-        entry_to_statement(&self, GadgetID::NONE)
+// HashablePayload trait, and PODPayload which implements it.
+
+pub trait HashablePayload: Clone + PartialEq {
+    fn to_field_vec(&self) -> Vec<GoldilocksField>;
+
+    fn hash_payload(&self) -> GoldilocksField {
+        let ins = self.to_field_vec();
+        PoseidonHash::hash_no_pad(&ins).to_vec()[0]
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct POD<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usize> {
-    pub payload: Payload,
-    proof: Proof,
+pub struct PODPayload {
+    statements_list: Vec<(String, Statement)>, // ORDERED list of statements, ordered by names
+    pub statements_map: HashMap<String, Statement>,
 }
 
-type SchnorrPOD = POD<Vec<Entry<ScalarOrVec>>, SchnorrSignature, { GadgetID::SCHNORR16 as usize }>;
+impl PODPayload {
+    pub fn new(statements: &HashMap<String, Statement>) -> Self {
+        let mut statements_and_names_list = Vec::new();
+        for (name, statement) in statements.iter() {
+            statements_and_names_list.push((name.clone(), statement.clone()));
+        }
+        statements_and_names_list.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            statements_list: statements_and_names_list,
+            statements_map: statements.clone(),
+        }
+    }
+}
 
-type GODPOD = POD<Vec<Statement>, SchnorrSignature, { GadgetID::GOD as usize }>;
+impl HashablePayload for Vec<Statement> {
+    fn to_field_vec(&self) -> Vec<GoldilocksField> {
+        self.iter()
+            .map(|statement| {
+                [
+                    vec![
+                        GoldilocksField(statement.predicate as u64),
+                        statement.origin1.origin_id,
+                        GoldilocksField(statement.origin1.gadget_id as u64),
+                        hash_string_to_field(&statement.key1),
+                    ],
+                    match &statement.origin2 {
+                        Some(o) => vec![o.origin_id, GoldilocksField(o.gadget_id as u64)],
+                        _ => vec![GoldilocksField(0), GoldilocksField(0)],
+                    },
+                    match &statement.key2 {
+                        Some(kn) => vec![hash_string_to_field(&kn)],
+                        _ => vec![GoldilocksField::ZERO],
+                    },
+                    match &statement.origin3 {
+                        Some(o) => vec![o.origin_id, GoldilocksField(o.gadget_id as u64)],
+                        _ => vec![GoldilocksField(0), GoldilocksField(0)],
+                    },
+                    match &statement.key3 {
+                        Some(kn) => vec![hash_string_to_field(&kn)],
+                        _ => vec![GoldilocksField::ZERO],
+                    },
+                    match &statement.optional_value {
+                        Some(x) => vec![x.hash_or_value()],
+                        _ => vec![GoldilocksField::ZERO],
+                    },
+                ]
+                .concat()
+            })
+            .collect::<Vec<Vec<GoldilocksField>>>()
+            .concat()
+    }
+}
+
+impl HashablePayload for PODPayload {
+    fn to_field_vec(&self) -> Vec<GoldilocksField> {
+        let mut statements_vec = Vec::new();
+        for (_, statement) in self.statements_list.iter() {
+            statements_vec.push(statement.clone());
+        }
+        statements_vec.to_field_vec()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum GadgetID {
+    NONE = 0,
+    SCHNORR16 = 1,
+    ORACLE = 2,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PODProof {
+    Schnorr(SchnorrSignature),
+    Oracle(SchnorrSignature),
+}
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum SchnorrOrGODPOD {
-    SchnorrPOD(SchnorrPOD),
-    GODPOD(GODPOD),
+pub struct POD {
+    pub payload: PODPayload,
+    proof: PODProof,
+    pub proof_type: GadgetID,
 }
 
-impl<Payload: HashablePayload, Proof: ProofOf<Payload>, const FromGadgetID: usize>
-    POD<Payload, Proof, FromGadgetID>
-{
+impl POD {
     pub fn verify(&self) -> Result<bool, Error> {
-        self.proof.verify(&self.payload)
-    }
-}
+        match self.proof {
+            PODProof::Schnorr(p) => {
+                if self.proof_type != GadgetID::SCHNORR16 {
+                    return Err("Proof and POD proofType mismatch".into());
+                }
 
-impl SchnorrPOD {
-    pub fn gadget(entries: &Vec<Entry<ScalarOrVec>>, sk: &SchnorrSecretKey) -> Self {
+                let payload_hash = self.payload.hash_payload();
+                let payload_hash_vec = vec![payload_hash];
+                let protocol = SchnorrSigner::new();
+
+                let wrapped_pk = self.payload.statements_map.get("VALUEOF:_signer");
+
+                if wrapped_pk == None {
+                    return Err("No signer found in payload".into());
+                }
+
+                let pk = match wrapped_pk.unwrap().optional_value {
+                    Some(ScalarOrVec::Vector(_)) => Err(Error::from("Signer is a vector")),
+                    Some(ScalarOrVec::Scalar(s)) => Ok(s),
+                    _ => Err("_signer key found but no corresponding value".into()),
+                }?;
+                Ok(protocol.verify(&p, &payload_hash_vec, &SchnorrPublicKey { pk }))
+            }
+            PODProof::Oracle(p) => {
+                if self.proof_type != GadgetID::ORACLE {
+                    return Err("Proof and POD proofType mismatch".into());
+                }
+
+                let payload_hash = self.payload.hash_payload();
+                let payload_hash_vec = vec![payload_hash];
+                let protocol = SchnorrSigner::new();
+
+                Ok(protocol.verify(
+                    &p,
+                    &payload_hash_vec,
+                    &protocol.keygen(&SchnorrSecretKey { sk: 0 }), // hardcoded secret key
+                ))
+            }
+            _ => Err("Invalid proof type".into()),
+        }
+    }
+
+    pub fn execute_schnorr_gadget(entries: &Vec<Entry>, sk: &SchnorrSecretKey) -> Self {
         let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
         let protocol = SchnorrSigner::new();
 
-        let mut payload = entries.clone();
-        payload.push(Entry::new(
-            "_signer",
-            ScalarOrVec::Scalar(protocol.keygen(sk).pk),
-        ));
+        let mut kv_pairs = entries.clone();
+        kv_pairs.push(Entry {
+            key: "_signer".to_string(),
+            value: ScalarOrVec::Scalar(protocol.keygen(sk).pk),
+        });
+        let mut statement_map: HashMap<String, Statement> = HashMap::new();
+
+        for entry in kv_pairs {
+            statement_map.insert(
+                "VALUEOF:".to_owned() + &entry.key,
+                Statement::from_entry(&entry, GadgetID::SCHNORR16),
+            );
+        }
+
+        let payload = PODPayload::new(&statement_map);
         let payload_hash = payload.hash_payload();
         let payload_hash_vec = vec![payload_hash];
         let proof = protocol.sign(&payload_hash_vec, sk, &mut rng);
-        Self { payload, proof }
+        Self {
+            payload,
+            proof: PODProof::Schnorr(proof),
+            proof_type: GadgetID::SCHNORR16,
+        }
     }
-}
 
-pub fn remap_origin_ids(inputs: &Vec<Vec<Statement>>) -> Vec<Vec<Statement>> {
-    let mut all_in_origin_ids = Vec::new();
-    for i in 0..inputs.len() {
-        for statement in inputs[i].iter() {
-            let left_origin_tuple = (i, statement.origin1.origin_id);
-            if !all_in_origin_ids.contains(&left_origin_tuple) {
-                all_in_origin_ids.push(left_origin_tuple);
-            }
-
-            if let Some(right_origin) = statement.origin2 {
-                let right_origin_tuple = (i, right_origin.origin_id);
-                if !all_in_origin_ids.contains(&right_origin_tuple) {
-                    all_in_origin_ids.push(right_origin_tuple);
+    pub fn execute_oracle_gadget(
+        input: &GPGInput,
+        cmds: &Vec<OperationCmd>,
+    ) -> Result<Self, Error> {
+        let mut statements = input.remap_origin_ids_by_name();
+        match &mut statements {
+            Ok(statements) => {
+                statements.insert("_SELF".to_string(), HashMap::new());
+                for cmd in cmds {
+                    let new_statement = cmd.execute(GadgetID::ORACLE, statements);
+                    match new_statement {
+                        Some(new_statement) => {
+                            statements.get_mut("_SELF").unwrap().insert(
+                                predicate_name(new_statement.predicate)
+                                    + ":"
+                                    + &cmd.output_statement_name,
+                                new_statement,
+                            );
+                        }
+                        None => {
+                            print!("{:?}", cmd);
+                            return Err("operation failed to execute".into());
+                        }
+                    }
                 }
+                let out_statements = statements.get("_SELF").unwrap();
+                let out_payload = PODPayload::new(out_statements);
+                let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
+                let protocol = SchnorrSigner::new();
+                let payload_hash = out_payload.hash_payload();
+                let payload_hash_vec = vec![payload_hash];
+
+                // signature is a hardcoded skey (currently 0)
+                // todo is to build a limited version of this with a ZKP
+                // would start by making it so that the ZKP only allows
+                // a max number of input PODs, max number of entries/statements per input POD,
+                // max number of statements for output POD, and some max number of each type of operation
+                let proof = protocol.sign(&payload_hash_vec, &SchnorrSecretKey { sk: 0 }, &mut rng);
+                Ok(Self {
+                    payload: out_payload,
+                    proof: PODProof::Oracle(proof),
+                    proof_type: GadgetID::ORACLE,
+                })
             }
+            Err(e) => panic!("Error: {:?}", e),
         }
     }
-
-    // sort all_in_origin_ids in place
-    all_in_origin_ids.sort_by(|a, b| {
-        let first_cmp = a.0.cmp(&b.0);
-        if first_cmp == Ordering::Equal {
-            (a.1).to_canonical_u64().cmp(&(b.1).to_canonical_u64())
-        } else {
-            first_cmp
-        }
-    });
-
-    let mut origin_id_map = HashMap::new();
-    for idx_and_origin_id in all_in_origin_ids.iter().enumerate() {
-        origin_id_map.insert(idx_and_origin_id.1, (idx_and_origin_id.0 + 2) as u64);
-    }
-
-    let mut remapped_inputs = Vec::new();
-
-    println!("origin id map: {:?}", origin_id_map);
-
-    for (idx, input) in inputs.iter().enumerate() {
-        let mut remapped_input = Vec::new();
-        for statement in input {
-            let mut remapped_statement = statement.clone();
-            println!("index: {:?}", idx);
-            println!("OLD statement: {:?}", remapped_statement);
-            remapped_statement.origin1.origin_id = GoldilocksField(
-                *origin_id_map
-                    .get(&(idx, remapped_statement.origin1.origin_id))
-                    .unwrap(),
-            );
-            if let Some(right_origin) = remapped_statement.origin2 {
-                remapped_statement.origin2 = Some(Origin {
-                    origin_id: GoldilocksField(
-                        *origin_id_map.get(&(idx, right_origin.origin_id)).unwrap(),
-                    ),
-                    gadget_id: right_origin.gadget_id,
-                });
-            }
-            println!("NEW statement: {:?}", remapped_statement);
-            remapped_input.push(remapped_statement);
-        }
-        remapped_inputs.push(remapped_input);
-    }
-    remapped_inputs
 }
 
-pub fn to_statements_with_remapping(inputs: &Vec<&SchnorrOrGODPOD>) -> Vec<Statement> {
-    let statements = inputs
-        .iter()
-        .map(|pod| match pod {
-            SchnorrOrGODPOD::GODPOD(p) => p.clone().payload,
-            SchnorrOrGODPOD::SchnorrPOD(p) => p
-                .payload
-                .iter()
-                .map(|entry| entry_to_statement(entry, GadgetID::SCHNORR16))
-                .collect::<Vec<Statement>>(),
-        })
-        .collect::<Vec<Vec<Statement>>>();
+// Operations
 
-    // Now remap
-    remap_origin_ids(&statements).concat()
+#[derive(Clone, Debug)]
+pub struct GPGInput {
+    pub pods_list: Vec<(String, POD)>, // ORDERED list of pods, ordered by names
+
+    // map from (pod name, old origin name) to new origin name
+    pub origin_renaming_map: HashMap<(String, String), String>,
 }
 
-impl GODPOD {
-    pub fn new(statements: &Vec<Statement>) -> Self {
-        let mut rng: rand::rngs::ThreadRng = rand::thread_rng();
-        let protocol = SchnorrSigner::new();
-        let payload = statements.clone();
-        let payload_hash = statements.hash_payload();
-        let payload_hash_vec = vec![payload_hash];
-
-        // signature is a hardcoded skey (currently 0)
-        // todo is to build a limited version of this with a ZKP
-        // would start by making it so that the ZKP only allows
-        // a max number of input PODs, max number of entries/statements per input POD,
-        // max number of statements for output POD, and some max number of each type of operation
-        let proof = protocol.sign(&payload_hash_vec, &SchnorrSecretKey { sk: 0 }, &mut rng);
-        Self { payload, proof }
-    }
-
-    pub fn gadget(
-        inputs: &Vec<&SchnorrOrGODPOD>, // will be converted to a vector of statements
-        operations: &Vec<(
-            Operation,
-            Option<usize>,
-            Option<usize>,
-            Option<usize>,
-            Option<&Entry<ScalarOrVec>>,
-        )>,
+impl GPGInput {
+    pub fn new(
+        named_pods: HashMap<String, POD>,
+        origin_renaming_map: HashMap<(String, String), String>,
     ) -> Self {
-        // Check all input pods are valid.
-        for pod in inputs {
-            match pod {
-                SchnorrOrGODPOD::GODPOD(p) => {
-                    assert!(p.verify().expect("input GODPOD verification failed"));
+        let mut pods_and_names_list = Vec::new();
+        let mut origin_renaming_map_clone = origin_renaming_map.clone();
+        for (name, pod) in named_pods.iter() {
+            pods_and_names_list.push((name.clone(), pod.clone()));
+            origin_renaming_map_clone.insert((name.clone(), "_SELF".to_string()), name.clone());
+        }
+        pods_and_names_list.sort_by(|a, b| a.0.cmp(&b.0));
+        return Self {
+            pods_list: pods_and_names_list,
+            origin_renaming_map: origin_renaming_map_clone,
+        };
+    }
+
+    // returns a map from input POD name to (map from statement name to statement)
+    // the inner statements have their old origin names and IDs are replaced with
+    // the new origin names as specified by inputs.origin_renaming_map
+    // and with new origin IDs which correspond to the lexicographic order of the new origin names
+    fn remap_origin_ids_by_name(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, Statement>>, Error> {
+        let mut new_origin_name_list = Vec::new();
+        for (_, new_name) in self.origin_renaming_map.iter() {
+            new_origin_name_list.push(new_name.clone());
+        }
+        new_origin_name_list.sort();
+
+        let mut new_origin_name_to_id_map = HashMap::new();
+        for (idx, new_name) in new_origin_name_list.iter().enumerate() {
+            new_origin_name_to_id_map.insert(new_name.clone(), idx + 2); // 0 reserved for none, 1 reserved for _SELF
+        }
+
+        let mut statements_with_renamed_origins = HashMap::new();
+
+        for (_, (pod_name, pod)) in self.pods_list.iter().enumerate() {
+            let mut inner_map = HashMap::new();
+
+            for (name, statement) in pod.payload.statements_map.iter() {
+                let mut statement_with_remapped_origins = statement.clone();
+                // origin 1
+                let new_origin1_name = self
+                    .origin_renaming_map
+                    .get(&(pod_name.clone(), statement.origin1.origin_name.clone()));
+                match new_origin1_name {
+                    Some(new_origin1_name) => {
+                        let new_origin1_id = new_origin_name_to_id_map.get(new_origin1_name);
+                        match new_origin1_id {
+                            Some(&new_origin1_id) => {
+                                statement_with_remapped_origins.origin1 = Origin {
+                                    origin_id: GoldilocksField(new_origin1_id as u64),
+                                    origin_name: new_origin1_name.clone(),
+                                    gadget_id: statement.origin1.gadget_id,
+                                }
+                            }
+                            None => {
+                                return Err(("couldn't find id for new origin: ".to_string()
+                                    + new_origin1_name)
+                                    .into());
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(("couldn't find new origin name for origin: ".to_string()
+                            + &pod_name.clone()
+                            + "."
+                            + &statement.origin1.origin_name.clone())
+                            .into())
+                    }
                 }
-                SchnorrOrGODPOD::SchnorrPOD(p) => {
-                    assert!(p.verify().expect("input SchnorrPOD verification failed"));
+                // origin 2
+                if let Some(old_origin2) = &statement.origin2 {
+                    let new_origin2_name = self
+                        .origin_renaming_map
+                        .get(&(pod_name.clone(), old_origin2.origin_name.clone()));
+                    match new_origin2_name {
+                        Some(new_origin2_name) => {
+                            let new_origin2_id = new_origin_name_to_id_map.get(new_origin2_name);
+                            match new_origin2_id {
+                                Some(&new_origin2_id) => {
+                                    statement_with_remapped_origins.origin2 = Some(Origin {
+                                        origin_id: GoldilocksField(new_origin2_id as u64),
+                                        origin_name: new_origin2_name.clone(),
+                                        gadget_id: old_origin2.gadget_id,
+                                    })
+                                }
+                                None => {
+                                    return Err(("couldn't find id for new origin: ".to_string()
+                                        + new_origin2_name)
+                                        .into());
+                                }
+                            }
+                        }
+                        None => {
+                            return Err(("couldn't find new origin name for origin: ".to_string()
+                                + &pod_name.clone()
+                                + "."
+                                + &old_origin2.origin_name.clone())
+                                .into())
+                        }
+                    }
                 }
+                // origin 3
+                if let Some(old_origin3) = &statement.origin3 {
+                    let new_origin3_name = self
+                        .origin_renaming_map
+                        .get(&(pod_name.clone(), old_origin3.origin_name.clone()));
+                    match new_origin3_name {
+                        Some(new_origin3_name) => {
+                            let new_origin3_id = new_origin_name_to_id_map.get(new_origin3_name);
+                            match new_origin3_id {
+                                Some(&new_origin3_id) => {
+                                    statement_with_remapped_origins.origin3 = Some(Origin {
+                                        origin_id: GoldilocksField(new_origin3_id as u64),
+                                        origin_name: new_origin3_name.clone(),
+                                        gadget_id: old_origin3.gadget_id,
+                                    })
+                                }
+                                None => {
+                                    return Err(("couldn't find id for new origin: ".to_string()
+                                        + new_origin3_name)
+                                        .into());
+                                }
+                            }
+                        }
+                        None => {
+                            return Err(("couldn't find new origin name for origin: ".to_string()
+                                + &pod_name.clone()
+                                + "."
+                                + &old_origin3.origin_name.clone())
+                                .into())
+                        }
+                    }
+                }
+
+                inner_map.insert(name.clone(), statement_with_remapped_origins);
             }
-        }
-        // Compile/arrange list of statements as Vec<Statement> (after converting each `Entry` into a `ValueOf` statement).
-        // and then remap
-        let remapped_statements = to_statements_with_remapping(inputs);
-
-        // apply operations one by one on remapped_statements
-        let mut final_statements = Vec::new();
-        for (operation, idx1, idx2, idx3, entry) in operations {
-            let statement1 = match idx1 {
-                Some(idx) => Some(&remapped_statements[*idx]),
-                None => None,
-            };
-            let statement2 = match idx2 {
-                Some(idx) => Some(&remapped_statements[*idx]),
-                None => None,
-            };
-            let statement3 = match idx3 {
-                Some(idx) => Some(&remapped_statements[*idx]),
-                None => None,
-            };
-            let optional_entry = match entry {
-                Some(entry) => Some(*entry),
-                None => None,
-            };
-            final_statements.push(operation.apply_operation(
-                GadgetID::GOD,
-                statement1,
-                statement2,
-                statement3,
-                optional_entry,
-            ))
+            statements_with_renamed_origins.insert(pod_name.clone(), inner_map);
         }
 
-        GODPOD::new(
-            &final_statements
-                .iter()
-                .map(|maybe_statement| maybe_statement.clone().unwrap())
-                .collect::<Vec<Statement>>(),
-        )
+        Ok(statements_with_renamed_origins)
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-pub enum Operation {
+pub enum OperationType {
     None = 0,
     NewEntry = 1,
     CopyStatement = 2,
@@ -450,57 +542,100 @@ pub enum Operation {
     GtFromEntries = 5,
     TransitiveEqualityFromStatements = 6,
     GtToNonequality = 7,
-    Contains = 8,
-    SumOf = 9,
+    ContainsFromEntries = 8,
+    RenameContainedBy = 9,
+    SumOf = 10,
 }
 
-impl Operation {
-    pub fn apply_operation<V: EntryValue>(
+#[derive(Clone, Debug)]
+pub struct OperationCmd {
+    pub operation_type: OperationType,
+    pub statement_1_parent: Option<String>,
+    pub statement_1_name: Option<String>,
+    pub statement_2_parent: Option<String>,
+    pub statement_2_name: Option<String>,
+    pub statement_3_parent: Option<String>,
+    pub statement_3_name: Option<String>,
+    pub optional_entry: Option<Entry>,
+    pub output_statement_name: String,
+}
+
+impl OperationCmd {
+    fn get_statement_with_origin_and_name(
+        statements: &HashMap<String, HashMap<String, Statement>>,
+        origin: Option<String>,
+        name: Option<String>,
+    ) -> Option<Statement> {
+        if let Some(origin) = origin {
+            if let Some(name) = name {
+                if let Some(map) = statements.get(&origin) {
+                    if let Some(statement) = map.get(&name) {
+                        return Some(statement.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn execute(
         &self,
         gadget_id: GadgetID,
-        statement1: Option<&Statement>,
-        statement2: Option<&Statement>,
-        statement3: Option<&Statement>,
-        optional_entry: Option<&Entry<V>>,
+        statements: &HashMap<String, HashMap<String, Statement>>,
+    ) -> Option<Statement> {
+        let statement1 = OperationCmd::get_statement_with_origin_and_name(
+            statements,
+            self.statement_1_parent.clone(),
+            self.statement_1_name.clone(),
+        );
+        let statement2 = OperationCmd::get_statement_with_origin_and_name(
+            statements,
+            self.statement_2_parent.clone(),
+            self.statement_2_name.clone(),
+        );
+        let statement3 = OperationCmd::get_statement_with_origin_and_name(
+            statements,
+            self.statement_3_parent.clone(),
+            self.statement_3_name.clone(),
+        );
+        let optional_entry = self.optional_entry.clone();
+
+        self.operation_type.apply_operation(
+            gadget_id,
+            statement1,
+            statement2,
+            statement3,
+            optional_entry,
+        )
+    }
+}
+
+impl OperationType {
+    pub fn apply_operation(
+        &self,
+        gadget_id: GadgetID,
+        statement1: Option<Statement>,
+        statement2: Option<Statement>,
+        statement3: Option<Statement>,
+        optional_entry: Option<Entry>,
     ) -> Option<Statement> {
         match (self, statement1, statement2, statement3, optional_entry) {
             // A new statement is created from a single `Entry`.
-            (Self::NewEntry, _, _, _, Some(entry)) => Some(entry_to_statement(&entry, gadget_id)),
-            // SumOf <=> statement 1's value = statement 2's value + statement 3's value
-            (Self::SumOf, Some(statement1), Some(statement2), Some(statement3), _) => {
-                if [
-                    statement1.predicate,
-                    statement2.predicate,
-                    statement3.predicate,
-                ]
-                .into_iter()
-                .all(|p| p == StatementPredicate::ValueOf)
-                    && (statement1.optional_value?
-                        == statement2.optional_value? + statement3.optional_value?)
-                {
-                    Some(Statement {
-                        predicate: StatementPredicate::SumOf,
-                        origin1: statement1.origin1,
-                        key1: statement1.key1.clone(),
-                        origin2: Some(statement2.origin1),
-                        key2: Some(statement2.key1.clone()),
-                        origin3: Some(statement3.origin1),
-                        key3: Some(statement3.key1.clone()),
-                        optional_value: None,
-                    })
-                } else {
-                    None
-                }
+            (OperationType::NewEntry, _, _, _, Some(entry)) => {
+                return Some(Statement::from_entry(&entry, gadget_id));
             }
             // A statement is copied from a single (left) statement.
-            (Self::CopyStatement, Some(statement), _, _, _) => Some(statement.clone()),
+            (OperationType::CopyStatement, Some(statement), _, _, _) => {
+                let mut cloned = statement.clone();
+                return Some(cloned);
+            }
             // Eq <=> Left entry = right entry
-            (Self::EqualityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
+            (OperationType::EqualityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
                 match (left_entry.predicate, right_entry.predicate) {
                     (StatementPredicate::ValueOf, StatementPredicate::ValueOf)
                         if left_entry.optional_value == right_entry.optional_value =>
                     {
-                        Some(Statement {
+                        return Some(Statement {
                             predicate: StatementPredicate::Equal,
                             origin1: left_entry.origin1,
                             key1: left_entry.key1.clone(),
@@ -509,18 +644,20 @@ impl Operation {
                             origin3: None,
                             key3: None,
                             optional_value: None,
-                        })
+                        });
                     }
-                    _ => None,
+                    _ => {
+                        return None;
+                    }
                 }
             }
             // Neq <=> Left entry != right entry
-            (Self::NonequalityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
+            (OperationType::NonequalityFromEntries, Some(left_entry), Some(right_entry), _, _) => {
                 match (left_entry.predicate, right_entry.predicate) {
                     (StatementPredicate::ValueOf, StatementPredicate::ValueOf)
                         if left_entry.optional_value != right_entry.optional_value =>
                     {
-                        Some(Statement {
+                        return Some(Statement {
                             predicate: StatementPredicate::NotEqual,
                             origin1: left_entry.origin1,
                             key1: left_entry.key1.clone(),
@@ -529,13 +666,15 @@ impl Operation {
                             origin3: None,
                             key3: None,
                             optional_value: None,
-                        })
+                        });
                     }
-                    _ => None,
+                    _ => {
+                        return None;
+                    }
                 }
             }
             // Gt <=> Left entry > right entry
-            (Self::GtFromEntries, Some(left_entry), Some(right_entry), _, _) => {
+            (OperationType::GtFromEntries, Some(left_entry), Some(right_entry), _, _) => {
                 match (
                     left_entry.predicate,
                     left_entry.optional_value,
@@ -544,11 +683,11 @@ impl Operation {
                 ) {
                     (
                         StatementPredicate::ValueOf,
-                        Some(left_value),
+                        Some(ScalarOrVec::Scalar(left_value)),
                         StatementPredicate::ValueOf,
-                        Some(right_value),
+                        Some(ScalarOrVec::Scalar(right_value)),
                     ) if left_value.to_canonical_u64() > right_value.to_canonical_u64() => {
-                        Some(Statement {
+                        return Some(Statement {
                             predicate: StatementPredicate::Gt,
                             origin1: left_entry.origin1,
                             key1: left_entry.key1.clone(),
@@ -557,15 +696,17 @@ impl Operation {
                             origin3: None,
                             key3: None,
                             optional_value: None,
-                        })
+                        });
                     }
-                    _ => None,
+                    _ => {
+                        return None;
+                    }
                 }
             }
             // Equality deduction: a = b ∧ b = c => a = c.
             // TODO: Allow for permutations of left/right values.
             (
-                Self::TransitiveEqualityFromStatements,
+                OperationType::TransitiveEqualityFromStatements,
                 Some(left_statement),
                 Some(right_statement),
                 _,
@@ -579,6 +720,7 @@ impl Operation {
                         origin2:
                             Some(Origin {
                                 origin_id: lr_origin_id,
+                                origin_name: _,
                                 gadget_id: _,
                             }),
                         key2: Some(lr_key_name),
@@ -591,6 +733,7 @@ impl Operation {
                         origin1:
                             Origin {
                                 origin_id: rl_origin_id,
+                                origin_name: _,
                                 gadget_id: _,
                             },
                         key1: rl_key_name,
@@ -603,9 +746,9 @@ impl Operation {
                 ) if (lr_origin_id, &lr_key_name) == ((rl_origin_id, &rl_key_name)) => {
                     Some(Statement {
                         predicate: StatementPredicate::Equal,
-                        origin1: *ll_origin,
+                        origin1: ll_origin.clone(),
                         key1: ll_key_name.clone(),
-                        origin2: *rr_origin,
+                        origin2: rr_origin.clone(),
                         key2: rr_key_name.clone(),
                         origin3: None,
                         key3: None,
@@ -614,7 +757,8 @@ impl Operation {
                 }
                 _ => None,
             },
-            (Self::GtToNonequality, Some(left_statement), _, _, _) => match left_statement {
+            (OperationType::GtToNonequality, Some(left_statement), _, _, _) => match left_statement
+            {
                 Statement {
                     predicate: StatementPredicate::Gt,
                     origin1: left_origin,
@@ -626,9 +770,9 @@ impl Operation {
                     optional_value: _,
                 } => Some(Statement {
                     predicate: StatementPredicate::NotEqual,
-                    origin1: *left_origin,
+                    origin1: left_origin.clone(),
                     key1: left_key_name.clone(),
-                    origin2: *right_origin,
+                    origin2: right_origin.clone(),
                     key2: right_key_name.clone(),
                     origin3: None,
                     key3: None,
@@ -636,8 +780,118 @@ impl Operation {
                 }),
                 _ => None,
             },
-            // TODO. also first need to make it so statement values can be vectors
-            (Self::Contains, _, _, _, _) => None,
+            (OperationType::ContainsFromEntries, Some(left_entry), Some(right_entry), _, _) => {
+                match (
+                    left_entry.predicate,
+                    left_entry.optional_value,
+                    right_entry.predicate,
+                    right_entry.optional_value,
+                ) {
+                    (
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Vector(vec1)),
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Scalar(val)),
+                    ) => {
+                        if vec1.contains(&val) {
+                            return Some(Statement {
+                                predicate: StatementPredicate::Contains,
+                                origin1: left_entry.origin1,
+                                key1: left_entry.key1.clone(),
+                                origin2: Some(right_entry.origin1),
+                                key2: Some(right_entry.key1.clone()),
+                                origin3: None,
+                                key3: None,
+                                optional_value: None,
+                            });
+                        }
+                        return None;
+                    }
+                    _ => {
+                        return None;
+                    }
+                }
+            }
+            (
+                OperationType::RenameContainedBy,
+                Some(left_statement),
+                Some(right_statement),
+                _,
+                _,
+            ) => match (left_statement, right_statement) {
+                (
+                    Statement {
+                        predicate: StatementPredicate::Contains,
+                        origin1: ll_origin,
+                        key1: ll_key_name,
+                        origin2: Some(lr_origin),
+                        key2: Some(lr_key_name),
+                        origin3: None,
+                        key3: None,
+                        optional_value: None,
+                    },
+                    Statement {
+                        predicate: StatementPredicate::Equal,
+                        origin1: rl_origin,
+                        key1: rl_key_name,
+                        origin2: Some(rr_origin),
+                        key2: Some(rr_key_name),
+                        origin3: None,
+                        key3: None,
+                        optional_value: None,
+                    },
+                ) if (ll_origin.origin_id, &ll_key_name)
+                    == ((rl_origin.origin_id, &rl_key_name)) =>
+                {
+                    return Some(Statement {
+                        predicate: StatementPredicate::Contains,
+                        origin1: rr_origin.clone(),
+                        key1: rr_key_name.clone(),
+                        origin2: Some(lr_origin.clone()),
+                        key2: Some(lr_key_name.clone()),
+                        origin3: None,
+                        key3: None,
+                        optional_value: None,
+                    });
+                }
+                _ => {
+                    return None;
+                }
+            },
+            // SumOf <=> statement 1's value = statement 2's value + statement 3's value
+            (OperationType::SumOf, Some(statement1), Some(statement2), Some(statement3), _) => {
+                match (
+                    statement1.predicate,
+                    statement1.optional_value,
+                    statement2.predicate,
+                    statement2.optional_value,
+                    statement3.predicate,
+                    statement3.optional_value,
+                ) {
+                    (
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Scalar(sum)),
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Scalar(left_addend)),
+                        StatementPredicate::ValueOf,
+                        Some(ScalarOrVec::Scalar(right_addend)),
+                    ) if (sum == left_addend + right_addend) => {
+                        return Some(Statement {
+                            predicate: StatementPredicate::SumOf,
+                            origin1: statement1.origin1,
+                            key1: statement1.key1.clone(),
+                            origin2: Some(statement2.origin1),
+                            key2: Some(statement2.key1.clone()),
+                            origin3: Some(statement3.origin1),
+                            key3: Some(statement3.key1.clone()),
+                            optional_value: None,
+                        });
+                    }
+                    _ => {
+                        return None;
+                    }
+                }
+            }
             _ => None,
         }
     }
@@ -652,40 +906,40 @@ fn op_test() -> Result<(), Error> {
     let vector_value = vec![scalar1, scalar2];
 
     // Create entries
-    let entry1 = Entry::new("some key", scalar1);
-    let entry2 = Entry::new("some other key", scalar2);
-    let entry3 = Entry::new("vector entry", vector_value.clone());
-    let entry4 = Entry::new("another scalar1", scalar1);
-    let entry5 = Entry::new("yet another scalar1", scalar1);
-    let entry6 = Entry::new("scalar3", scalar3);
+    let entry1 = Entry::newFromScalar("some key".to_string(), scalar1);
+    let entry2 = Entry::newFromScalar("some other key".to_string(), scalar2);
+    let entry3 = Entry::newFromVec("vector entry".to_string(), vector_value.clone());
+    let entry4 = Entry::newFromScalar("another scalar1".to_string(), scalar1);
+    let entry5 = Entry::newFromScalar("yet another scalar1".to_string(), scalar1);
+    let entry6 = Entry::newFromScalar("scalar3".to_string(), scalar3);
 
     // Create entry statements.
-    let entry_statement1 = entry1.into();
-    let entry_statement2 = entry2.into();
-    let entry_statement3 = entry3.into();
-    let entry_statement4 = entry4.into();
-    let entry_statement5 = entry5.into();
-    let entry_statement6 = entry6.into();
+    let entry_statement1 = Statement::from_entry(&entry1, GadgetID::NONE);
+    let entry_statement2 = Statement::from_entry(&entry2, GadgetID::NONE);
+    let entry_statement3 = Statement::from_entry(&entry3, GadgetID::NONE);
+    let entry_statement4 = Statement::from_entry(&entry4, GadgetID::NONE);
+    let entry_statement5 = Statement::from_entry(&entry5, GadgetID::NONE);
+    let entry_statement6 = Statement::from_entry(&entry6, GadgetID::NONE);
 
     // Entry 2's value = entry 1's value + entry 6's value
-    let sum_of_statement = Operation::SumOf
+    let sum_of_statement = OperationType::SumOf
         .apply_operation(
-            GadgetID::GOD,
-            Some(&entry_statement2),
-            Some(&entry_statement1),
-            Some(&entry_statement6),
-            <Option<&Entry<GoldilocksField>>>::None,
+            GadgetID::ORACLE,
+            Some(entry_statement2.clone()),
+            Some(entry_statement1.clone()),
+            Some(entry_statement6.clone()),
+            <Option<Entry>>::None,
         )
         .unwrap();
     assert!(
         sum_of_statement
             == Statement {
                 predicate: StatementPredicate::SumOf,
-                origin1: entry_statement2.origin1,
+                origin1: entry_statement2.origin1.clone(),
                 key1: entry_statement2.key1.clone(),
-                origin2: Some(entry_statement1.origin1),
+                origin2: Some(entry_statement1.origin1.clone()),
                 key2: Some(entry_statement1.key1.clone()),
-                origin3: Some(entry_statement6.origin1),
+                origin3: Some(entry_statement6.origin1.clone()),
                 key3: Some(entry_statement6.key1.clone()),
                 optional_value: None
             }
@@ -695,36 +949,44 @@ fn op_test() -> Result<(), Error> {
 
     // Copy statements and check for equality of entries.
     entries.into_iter().for_each(|statement| {
-        let copy = Operation::CopyStatement
-            .apply_operation::<GoldilocksField>(GadgetID::GOD, Some(statement), None, None, None)
+        let copy = OperationType::CopyStatement
+            .apply_operation(GadgetID::NONE, Some(statement.clone()), None, None, None)
             .expect("This value should exist.");
         assert!(&copy == statement);
     });
 
     // Equality checks
-    println!(
-        "{:?}",
-        Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
-            GadgetID::GOD,
-            Some(&entry_statement1),
-            Some(&entry_statement2),
+    assert!(
+        OperationType::EqualityFromEntries.apply_operation(
+            GadgetID::NONE,
+            Some(entry_statement1.clone()),
+            Some(entry_statement4.clone()),
             None,
-            None
-        )
+            None,
+        ) == Some(Statement {
+            predicate: StatementPredicate::Equal,
+            origin1: entry_statement1.origin1.clone(),
+            key1: entry_statement1.key1.clone(),
+            origin2: Some(entry_statement4.origin1.clone()),
+            key2: Some(entry_statement4.key1.clone()),
+            origin3: None,
+            key3: None,
+            optional_value: None
+        })
     );
     entries.into_iter().for_each(|statement| {
         assert!(
-            Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
-                GadgetID::GOD,
-                Some(statement),
-                Some(statement),
+            OperationType::EqualityFromEntries.apply_operation(
+                GadgetID::NONE,
+                Some(statement.clone()),
+                Some(statement.clone()),
                 None,
-                None
+                None,
             ) == Some(Statement {
                 predicate: StatementPredicate::Equal,
-                origin1: statement.origin1,
+                origin1: statement.origin1.clone(),
                 key1: statement.key1.clone(),
-                origin2: Some(statement.origin1),
+                origin2: Some(statement.origin1.clone()),
                 key2: Some(statement.key1.clone()),
                 origin3: None,
                 key3: None,
@@ -732,36 +994,39 @@ fn op_test() -> Result<(), Error> {
             })
         );
     });
-    // assert!(
-    //     Operation::NonequalityFromEntries.apply_operation::<GoldilocksField>(
-    //         GadgetID::GOD,
-    //         Some(&entry_statement1),
-    //         Some(&entry_statement2),
-    //         None
-    //     ) == Some(Statement {
-    //         predicate: StatementPredicate::Equal,
-    //         left_origin: entry_statement1.left_origin,
-    //         left_key_name: entry_statement1.left_key_name.clone(),
-    //         right_origin: Some(entry_statement2.left_origin),
-    //         right_key_name: Some(entry_statement2.left_key_name.clone()),
-    //         optional_value: None
-    //     })
-    // );
     assert!(
-        Operation::EqualityFromEntries.apply_operation::<GoldilocksField>(
-            GadgetID::GOD,
-            Some(&entry_statement1),
-            Some(&entry_statement2),
+        OperationType::NonequalityFromEntries.apply_operation(
+            GadgetID::NONE,
+            Some(entry_statement1.clone()),
+            Some(entry_statement2.clone()),
+            None,
+            None
+        ) == Some(Statement {
+            predicate: StatementPredicate::NotEqual,
+            origin1: entry_statement1.origin1.clone(),
+            key1: entry_statement1.key1.clone(),
+            origin2: Some(entry_statement2.origin1.clone()),
+            key2: Some(entry_statement2.key1.clone()),
+            origin3: None,
+            key3: None,
+            optional_value: None
+        })
+    );
+    assert!(
+        OperationType::EqualityFromEntries.apply_operation(
+            GadgetID::NONE,
+            Some(entry_statement1.clone()),
+            Some(entry_statement2.clone()),
             None,
             None
         ) == None
     );
 
     // Gt check
-    let gt_statement = Operation::GtFromEntries.apply_operation::<GoldilocksField>(
-        GadgetID::GOD,
-        Some(&entry_statement2),
-        Some(&entry_statement1),
+    let gt_statement = OperationType::GtFromEntries.apply_operation(
+        GadgetID::NONE,
+        Some(entry_statement2.clone()),
+        Some(entry_statement1.clone()),
         None,
         None,
     );
@@ -769,9 +1034,9 @@ fn op_test() -> Result<(), Error> {
         gt_statement
             == Some(Statement {
                 predicate: StatementPredicate::Gt,
-                origin1: entry_statement2.origin1,
+                origin1: entry_statement2.origin1.clone(),
                 key1: entry_statement2.key1.clone(),
-                origin2: Some(entry_statement1.origin1),
+                origin2: Some(entry_statement1.origin1.clone()),
                 key2: Some(entry_statement1.key1.clone()),
                 origin3: None,
                 key3: None,
@@ -780,39 +1045,39 @@ fn op_test() -> Result<(), Error> {
     );
 
     // Eq transitivity check
-    let eq_statement1 = Operation::EqualityFromEntries
-        .apply_operation::<GoldilocksField>(
-            GadgetID::GOD,
-            Some(&entry_statement4),
-            Some(&entry_statement1),
+    let eq_statement1 = OperationType::EqualityFromEntries
+        .apply_operation(
+            GadgetID::NONE,
+            Some(entry_statement4.clone()),
+            Some(entry_statement1.clone()),
             None,
             None,
         )
         .unwrap();
-    let eq_statement2 = Operation::EqualityFromEntries
-        .apply_operation::<GoldilocksField>(
-            GadgetID::GOD,
-            Some(&entry_statement1),
-            Some(&entry_statement5),
+    let eq_statement2 = OperationType::EqualityFromEntries
+        .apply_operation(
+            GadgetID::NONE,
+            Some(entry_statement1.clone()),
+            Some(entry_statement5.clone()),
             None,
             None,
         )
         .unwrap();
-    let eq_statement3 = Operation::EqualityFromEntries
-        .apply_operation::<GoldilocksField>(
-            GadgetID::GOD,
-            Some(&entry_statement4),
-            Some(&entry_statement5),
+    let eq_statement3 = OperationType::EqualityFromEntries
+        .apply_operation(
+            GadgetID::NONE,
+            Some(entry_statement4.clone()),
+            Some(entry_statement5.clone()),
             None,
             None,
         )
         .unwrap();
 
     assert!(
-        Operation::TransitiveEqualityFromStatements.apply_operation::<GoldilocksField>(
-            GadgetID::GOD,
-            Some(&eq_statement1),
-            Some(&eq_statement2),
+        OperationType::TransitiveEqualityFromStatements.apply_operation(
+            GadgetID::NONE,
+            Some(eq_statement1.clone()),
+            Some(eq_statement2.clone()),
             None,
             None
         ) == Some(eq_statement3)
@@ -823,9 +1088,9 @@ fn op_test() -> Result<(), Error> {
     let mut expected_statement = unwrapped_gt_statement.clone();
     expected_statement.predicate = StatementPredicate::NotEqual;
     assert!(
-        Operation::GtToNonequality.apply_operation::<GoldilocksField>(
-            GadgetID::GOD,
-            Some(&unwrapped_gt_statement),
+        OperationType::GtToNonequality.apply_operation(
+            GadgetID::NONE,
+            Some(unwrapped_gt_statement.clone()),
             None,
             None,
             None
@@ -841,30 +1106,37 @@ fn schnorr_pod_test() -> Result<(), Error> {
     let scalar2 = GoldilocksField(52);
     let vector_value = vec![scalar1, scalar2];
 
-    let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
-    let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
-    let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
+    let entry1 = Entry::newFromScalar("some key".to_string(), scalar1);
+    let entry2 = Entry::newFromScalar("some other key".to_string(), scalar2);
+    let entry3 = Entry::newFromVec("vector entry".to_string(), vector_value.clone());
 
-    let schnorrPOD1 = SchnorrPOD::gadget(
+    let schnorrPOD1 = POD::execute_schnorr_gadget(
         &vec![entry1.clone(), entry2.clone()],
         &SchnorrSecretKey { sk: 25 },
     );
 
-    let schnorrPOD2 = SchnorrPOD::gadget(
+    let schnorrPOD2 = POD::execute_schnorr_gadget(
         &vec![entry2.clone(), entry3.clone()],
         &SchnorrSecretKey { sk: 42 },
     );
 
-    let schnorrPOD3 = SchnorrPOD::gadget(&vec![entry1.clone()], &SchnorrSecretKey { sk: 25 });
-
-    // println!(
-    //     "verify schnorrpod1: {:?}",
-    //     schnorrPOD1.clone().payload.to_field_vec()
-    // );
-    // println!("verify schnorrpod2: {:?}", schnorrPOD2.verify());
-
     assert!(schnorrPOD1.verify()? == true);
     assert!(schnorrPOD2.verify()? == true);
+
+    let mut schnorrPOD3 =
+        POD::execute_schnorr_gadget(&vec![entry1.clone()], &SchnorrSecretKey { sk: 25 });
+
+    // modify the internal value of the valueOf statement in schnorrPOD3
+    let stmt_in_map = schnorrPOD3
+        .payload
+        .statements_map
+        .get_mut("VALUEOF:some key");
+    stmt_in_map.unwrap().optional_value = Some(ScalarOrVec::Scalar(GoldilocksField(37)));
+    schnorrPOD3.payload.statements_list[1].1.optional_value =
+        Some(ScalarOrVec::Scalar(GoldilocksField(37)));
+
+    // now signature shouldn't verify
+    assert!(schnorrPOD3.verify()? == false);
 
     // // ZK verification of SchnorrPOD 3.
     // let (builder, targets) = pod2_circuit(1, 2, 0, 0)?;
@@ -890,146 +1162,812 @@ fn schnorr_pod_test() -> Result<(), Error> {
     Ok(())
 }
 
+// i haven't written asserts yet to check the correctness of oracle and oracle2 pods
+// but i've manually inspected output and it looks good
 #[test]
-fn god_pod_from_schnorr_test() -> Result<(), Error> {
+fn oracle_pod_from_schnorr_test() -> Result<(), Error> {
+    println!("oracle_pod_from_schnorr_test");
     // Start with some values.
     let scalar1 = GoldilocksField(36);
     let scalar2 = GoldilocksField(52);
-    let scalar3 = GoldilocksField(90);
+    let scalar3 = GoldilocksField(88);
     let vector_value = vec![scalar1, scalar2];
 
     // make entries
-    let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
-    let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
-    let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
-    let entry4 = Entry::new("new key", ScalarOrVec::Scalar(scalar2));
-    let entry5 = Entry::new("foo", ScalarOrVec::Scalar(GoldilocksField(100)));
-    let entry6 = Entry::new("baz", ScalarOrVec::Scalar(GoldilocksField(120)));
-    let entry7 = Entry::new("yum", ScalarOrVec::Scalar(scalar2));
-    let entry9 = Entry::new("godpod introduced entry key", ScalarOrVec::Scalar(scalar3));
+    let entry1 = Entry::newFromScalar("apple".to_string(), scalar1);
+    let entry2 = Entry::newFromScalar("banana".to_string(), scalar2);
+    let entry3 = Entry::newFromVec("vector entry".to_string(), vector_value.clone());
+    let entry4 = Entry::newFromScalar("scalar entry".to_string(), scalar2);
+    let entry5 = Entry::newFromScalar("foo".to_string(), GoldilocksField(100));
+    let entry6 = Entry::newFromScalar("baz".to_string(), GoldilocksField(120));
+    let entry7 = Entry::newFromScalar("bar".to_string(), scalar2);
+    let entry9 = Entry::newFromScalar("claimed sum".to_string(), scalar3);
 
     // three schnorr pods
-    let schnorrPOD1 = SchnorrPOD::gadget(
+    let schnorrPOD1 = POD::execute_schnorr_gadget(
         &vec![entry1.clone(), entry2.clone()],
         &SchnorrSecretKey { sk: 25 },
     );
 
-    let schnorrPOD2 = SchnorrPOD::gadget(
+    let schnorrPOD2 = POD::execute_schnorr_gadget(
         &vec![entry3.clone(), entry4.clone()],
         &SchnorrSecretKey { sk: 42 },
     );
+    // make an OraclePOD using from_pods called on the two schnorr PODs
 
-    let schnorrPOD3 = SchnorrPOD::gadget(
+    // first make the GPG input
+
+    // make a map of named POD inputs
+    let mut named_input_pods = HashMap::new();
+    named_input_pods.insert("p1".to_string(), schnorrPOD1.clone());
+    named_input_pods.insert("schnorrPOD2".to_string(), schnorrPOD2.clone());
+
+    // make a map of (pod name, old origin name) to new origin name
+    let mut origin_renaming_map = HashMap::new();
+    // all the inputs are schnorr PODs whose only referenced origin is _SELF
+    // _SELF is taken care of automatically so origin_renaming_map can be empty
+
+    let gpg_input = GPGInput::new(named_input_pods, origin_renaming_map);
+
+    // make a list of the operations we want to call
+    let ops = vec![
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("p1".to_string()),
+            statement_1_name: Some("VALUEOF:apple".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "p1-apple".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("p1".to_string()),
+            statement_1_name: Some("VALUEOF:banana".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "p1-banana".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("p1".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "p1-signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD2".to_string()),
+            statement_1_name: Some("VALUEOF:vector entry".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD2-vec-entry".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD2".to_string()),
+            statement_1_name: Some("VALUEOF:scalar entry".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "a scalar entry".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("schnorrPOD2".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "schnorrPOD2-signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("p1".to_string()),
+            statement_1_name: Some("VALUEOF:banana".to_string()),
+            statement_2_parent: Some("schnorrPOD2".to_string()),
+            statement_2_name: Some("VALUEOF:scalar entry".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "eq1".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::GtFromEntries,
+            statement_1_parent: Some("p1".to_string()),
+            statement_1_name: Some("VALUEOF:banana".to_string()),
+            statement_2_parent: Some("p1".to_string()),
+            statement_2_name: Some("VALUEOF:apple".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "apple banana comparison".to_string(),
+        },
+        // this operation creates a statement on top of a statement
+        // created by an earlier operation
+        OperationCmd {
+            operation_type: OperationType::ContainsFromEntries,
+            statement_1_parent: Some("_SELF".to_string()),
+            statement_1_name: Some("VALUEOF:schnorrPOD2-vec-entry".to_string()),
+            statement_2_parent: Some("p1".to_string()),
+            statement_2_name: Some("VALUEOF:apple".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "CONTAINS:contains1".to_string(),
+        },
+    ];
+
+    let oracle_pod = POD::execute_oracle_gadget(&gpg_input, &ops).unwrap();
+    assert!(oracle_pod.verify()? == true);
+
+    // make another oracle POD which takes that oracle POD and a schnorr POD
+
+    let schnorrPOD3 = POD::execute_schnorr_gadget(
         &vec![entry5.clone(), entry6.clone(), entry7.clone()],
         &SchnorrSecretKey { sk: 83 },
     );
 
-    // make a GODPOD using from_pods called on the two schnorr PODs
-    let god_pod_1 = GODPOD::gadget(
-        &vec![
-            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD1.clone()),
-            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD2.clone()),
-            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
-        ],
-        &vec![
-            (Operation::CopyStatement, Some(0), None, None, None),
-            (Operation::CopyStatement, Some(1), None, None, None),
-            (Operation::CopyStatement, Some(2), None, None, None),
-            (Operation::CopyStatement, Some(3), None, None, None),
-            (Operation::CopyStatement, Some(4), None, None, None),
-            (Operation::CopyStatement, Some(5), None, None, None),
-            (Operation::NewEntry, None, None, None, Some(&entry9)),
-            (Operation::EqualityFromEntries, Some(1), Some(4), None, None),
-            (Operation::EqualityFromEntries, Some(4), Some(8), None, None),
-            (
-                Operation::NonequalityFromEntries,
-                Some(0),
-                Some(1),
-                None,
-                None,
-            ),
-            (Operation::GtFromEntries, Some(1), Some(0), None, None),
-        ],
+    // make the GPG input
+
+    // make a map of named POD inputs
+    let mut named_input_pods2 = HashMap::new();
+    named_input_pods2.insert("oraclePODParent".to_string(), oracle_pod.clone());
+    named_input_pods2.insert("p3".to_string(), schnorrPOD3.clone());
+
+    // make a map of (pod name, old origin name) to new origin name
+    let mut origin_renaming_map2 = HashMap::new();
+    // let's keep the name of the first origin and shorten the name of the second origin
+    origin_renaming_map2.insert(
+        ("oraclePODParent".to_string(), "p1".to_string()),
+        "p1".to_string(),
     );
-    println!("GODPOD1: {:?}", god_pod_1);
-    assert!(god_pod_1.verify()? == true);
-
-    // another GODPOD from the first GODPOD and another schnorr POD
-
-    let god_pod_2 = GODPOD::gadget(
-        &vec![
-            &SchnorrOrGODPOD::GODPOD(god_pod_1.clone()),
-            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD3.clone()),
-        ],
-        &vec![
-            (Operation::CopyStatement, Some(8), None, None, None),
-            (Operation::CopyStatement, Some(9), None, None, None),
-            (Operation::CopyStatement, Some(3), None, None, None),
-            (Operation::GtFromEntries, Some(6), Some(0), None, None),
-            (
-                Operation::TransitiveEqualityFromStatements,
-                Some(7),
-                Some(8),
-                None,
-                None,
-            ),
-            (Operation::GtToNonequality, Some(10), None, None, None),
-        ],
+    origin_renaming_map2.insert(
+        ("oraclePODParent".to_string(), "schnorrPOD2".to_string()),
+        "p2".to_string(),
     );
-    println!("GODPOD2: {:?}", god_pod_2);
 
-    // println!(
-    //     "verify schnorrpod1: {:?}",
-    //     schnorrPOD1.clone().payload.to_field_vec()
-    // );
-    // println!("verify schnorrpod2: {:?}", schnorrPOD2.verify());
+    let gpg_input = GPGInput::new(named_input_pods2, origin_renaming_map2);
 
-    assert!(god_pod_2.verify()? == true);
+    // make a list of the operations we want to call
 
+    let ops = vec![
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("oraclePODParent".to_string()),
+            statement_1_name: Some("VALUEOF:a scalar entry".to_string()),
+            statement_2_parent: Some("p3".to_string()),
+            statement_2_name: Some("VALUEOF:bar".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "eq2".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::TransitiveEqualityFromStatements,
+            statement_1_parent: Some("oraclePODParent".to_string()),
+            statement_1_name: Some("EQUAL:eq1".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("EQUAL:eq2".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "EQUAL:transitive eq".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NewEntry,
+            statement_1_parent: None,
+            statement_1_name: None,
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(entry9.clone()),
+            output_statement_name: "entry for claimed sum".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::SumOf,
+            statement_1_parent: Some("_SELF".to_string()),
+            statement_1_name: Some("VALUEOF:entry for claimed sum".to_string()),
+            statement_2_parent: Some("oraclePODParent".to_string()),
+            statement_2_name: Some("VALUEOF:p1-apple".to_string()),
+            statement_3_parent: Some("oraclePODParent".to_string()),
+            statement_3_name: Some("VALUEOF:a scalar entry".to_string()),
+            optional_entry: None,
+            output_statement_name: "sumof entry".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("oraclePODParent".to_string()),
+            statement_1_name: Some("VALUEOF:schnorrPOD2-signer".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "p2-signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::GtToNonequality,
+            statement_1_parent: Some("oraclePODParent".to_string()),
+            statement_1_name: Some("GT:apple banana comparison".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "apple banana nonequality".to_string(),
+        },
+    ];
+
+    let oracle_pod2 = POD::execute_oracle_gadget(&gpg_input, &ops).unwrap();
+    for statement in oracle_pod2.payload.statements_list.iter() {
+        println!("{:?}", statement);
+    }
+    assert!(oracle_pod2.verify()? == true);
     Ok(())
 }
 
 #[test]
-#[should_panic]
-fn god_pod_should_panic() {
-    // Start with some values.
-    let scalar1 = GoldilocksField(36);
-    let scalar2 = GoldilocksField(52);
-    let scalar3 = GoldilocksField(90);
-    let vector_value = vec![scalar1, scalar2];
+fn goodboy_test() -> Result<(), Error> {
+    let protocol = SchnorrSigner::new();
 
-    // make entries
-    let entry1 = Entry::new("some key", ScalarOrVec::Scalar(scalar1));
-    let entry2 = Entry::new("some other key", ScalarOrVec::Scalar(scalar2));
-    let entry3 = Entry::new("vector entry", ScalarOrVec::Vector(vector_value.clone()));
-    let entry4 = Entry::new("new key", ScalarOrVec::Scalar(scalar2));
-    let entry5 = Entry::new("foo", ScalarOrVec::Scalar(GoldilocksField(100)));
-    let entry6 = Entry::new("foo", ScalarOrVec::Scalar(GoldilocksField(120)));
-    let entry9 = Entry::new("godpod introduced entry key", ScalarOrVec::Scalar(scalar3));
+    let alice_sk = SchnorrSecretKey { sk: 25 };
+    let alice_pk = protocol.keygen(&alice_sk).pk;
+    let bob_sk = SchnorrSecretKey { sk: 26 };
+    let bob_pk = protocol.keygen(&bob_sk).pk;
+    let charlie_sk = SchnorrSecretKey { sk: 27 };
+    let charlie_pk = protocol.keygen(&charlie_sk).pk;
 
-    // three schnorr pods
-    let schnorrPOD1 = SchnorrPOD::gadget(
-        &vec![entry1.clone(), entry2.clone()],
-        &SchnorrSecretKey { sk: 25 },
+    let goog_sk = SchnorrSecretKey { sk: 28 };
+    let goog_pk = protocol.keygen(&goog_sk).pk;
+    let msft_sk = SchnorrSecretKey { sk: 29 };
+    let msft_pk = protocol.keygen(&msft_sk).pk;
+    let fb_sk = SchnorrSecretKey { sk: 30 };
+    let fb_pk = protocol.keygen(&fb_sk).pk;
+
+    let known_attestors = vec![goog_pk, msft_pk, fb_pk];
+
+    let gb1_user = Entry::newFromScalar("user".to_string(), bob_pk);
+    let gb1_age = Entry::newFromScalar("age".to_string(), GoldilocksField(27));
+    let gb1 = POD::execute_schnorr_gadget(&vec![gb1_user.clone(), gb1_age.clone()], &goog_sk);
+
+    let gb2_user = Entry::newFromScalar("user".to_string(), bob_pk);
+    let gb2 = POD::execute_schnorr_gadget(&vec![gb2_user.clone()], &msft_sk);
+
+    let gb3_user = Entry::newFromScalar("user".to_string(), charlie_pk);
+    let gb3_age = Entry::newFromScalar("age".to_string(), GoldilocksField(18));
+    let gb3 = POD::execute_schnorr_gadget(&vec![gb3_user.clone(), gb3_age.clone()], &msft_sk);
+
+    let gb4_user = Entry::newFromScalar("user".to_string(), charlie_pk);
+    let gb4 = POD::execute_schnorr_gadget(&vec![gb4_user.clone()], &fb_sk);
+
+    let alice_user_entry = Entry::newFromScalar("user".to_string(), alice_pk);
+    let known_attestors_entry =
+        Entry::newFromVec("known_attestors".to_string(), known_attestors.clone());
+
+    let bob_alice = POD::execute_schnorr_gadget(&vec![alice_user_entry.clone()], &bob_sk);
+    let charlie_alice = POD::execute_schnorr_gadget(&vec![alice_user_entry.clone()], &charlie_sk);
+
+    // make the "bob trusted friend" POD
+    let mut bob_tf_input_pods = HashMap::new();
+    bob_tf_input_pods.insert("bob-gb1".to_string(), gb1.clone());
+    bob_tf_input_pods.insert("bob-gb2".to_string(), gb2.clone());
+    bob_tf_input_pods.insert("bob-alice".to_string(), bob_alice.clone());
+
+    let bob_tf_input = GPGInput::new(bob_tf_input_pods, HashMap::new());
+
+    let bob_tf_ops = vec![
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("bob-alice".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "bob-alice signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("bob-alice".to_string()),
+            statement_1_name: Some("VALUEOF:user".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "bob-alice user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("bob-gb1".to_string()),
+            statement_1_name: Some("VALUEOF:age".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "bob age".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NewEntry,
+            statement_1_parent: None,
+            statement_1_name: None,
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "known_attestors".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("bob-alice".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: Some("bob-gb1".to_string()),
+            statement_2_name: Some("VALUEOF:user".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb1 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("bob-alice".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: Some("bob-gb2".to_string()),
+            statement_2_name: Some("VALUEOF:user".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb2 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NonequalityFromEntries,
+            statement_1_parent: Some("bob-gb1".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: Some("bob-gb2".to_string()),
+            statement_2_name: Some("VALUEOF:_signer".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb1 and gb2 are different".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::ContainsFromEntries,
+            statement_1_parent: Some("_SELF".to_string()),
+            statement_1_name: Some("VALUEOF:known_attestors".to_string()),
+            statement_2_parent: Some("bob-gb1".to_string()),
+            statement_2_name: Some("VALUEOF:_signer".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb1 has known signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::ContainsFromEntries,
+            statement_1_parent: Some("_SELF".to_string()),
+            statement_1_name: Some("VALUEOF:known_attestors".to_string()),
+            statement_2_parent: Some("bob-gb2".to_string()),
+            statement_2_name: Some("VALUEOF:_signer".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb2 has known signer".to_string(),
+        },
+    ];
+
+    let bob_tf = POD::execute_oracle_gadget(&bob_tf_input, &bob_tf_ops).unwrap();
+    assert!(bob_tf.verify()? == true);
+
+    // make the "bob trusted friend" POD
+    let mut charlie_tf_input_pods = HashMap::new();
+    charlie_tf_input_pods.insert("charlie-gb3".to_string(), gb3.clone());
+    charlie_tf_input_pods.insert("charlie-gb4".to_string(), gb4.clone());
+    charlie_tf_input_pods.insert("charlie-alice".to_string(), charlie_alice.clone());
+
+    let charlie_tf_input = GPGInput::new(charlie_tf_input_pods, HashMap::new());
+
+    let charlie_tf_ops = vec![
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("charlie-alice".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "charlie-alice signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("charlie-alice".to_string()),
+            statement_1_name: Some("VALUEOF:user".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "charlie-alice user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("charlie-gb3".to_string()),
+            statement_1_name: Some("VALUEOF:age".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "charlie age".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NewEntry,
+            statement_1_parent: None,
+            statement_1_name: None,
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "known_attestors".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("charlie-alice".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: Some("charlie-gb3".to_string()),
+            statement_2_name: Some("VALUEOF:user".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb3 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("charlie-alice".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: Some("charlie-gb4".to_string()),
+            statement_2_name: Some("VALUEOF:user".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb4 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NonequalityFromEntries,
+            statement_1_parent: Some("charlie-gb3".to_string()),
+            statement_1_name: Some("VALUEOF:_signer".to_string()),
+            statement_2_parent: Some("charlie-gb4".to_string()),
+            statement_2_name: Some("VALUEOF:_signer".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb3 and gb4 are different".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::ContainsFromEntries,
+            statement_1_parent: Some("_SELF".to_string()),
+            statement_1_name: Some("VALUEOF:known_attestors".to_string()),
+            statement_2_parent: Some("charlie-gb3".to_string()),
+            statement_2_name: Some("VALUEOF:_signer".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb3 has known signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::ContainsFromEntries,
+            statement_1_parent: Some("_SELF".to_string()),
+            statement_1_name: Some("VALUEOF:known_attestors".to_string()),
+            statement_2_parent: Some("charlie-gb4".to_string()),
+            statement_2_name: Some("VALUEOF:_signer".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "gb4 has known signer".to_string(),
+        },
+    ];
+
+    let charlie_tf = POD::execute_oracle_gadget(&charlie_tf_input, &charlie_tf_ops).unwrap();
+    assert!(charlie_tf.verify()? == true);
+
+    // make the "great boy" POD
+    let age_bound_entry = Entry::newFromScalar("known_attestors".to_string(), GoldilocksField(17));
+    let age_sum_entry = Entry::newFromScalar("age_sum".to_string(), GoldilocksField(45));
+    let mut grb_input_pods = HashMap::new();
+    grb_input_pods.insert("friend1".to_string(), bob_tf.clone());
+    grb_input_pods.insert("friend2".to_string(), charlie_tf.clone());
+
+    // make a map of (pod name, old origin name) to new origin name
+    let mut grb_origin_rename_map = HashMap::new();
+    // let's keep the name of the first origin and shorten the name of the second origin
+    grb_origin_rename_map.insert(
+        ("friend1".to_string(), "bob-gb1".to_string()),
+        "gb1".to_string(),
+    );
+    grb_origin_rename_map.insert(
+        ("friend1".to_string(), "bob-gb2".to_string()),
+        "gb2".to_string(),
+    );
+    grb_origin_rename_map.insert(
+        ("friend1".to_string(), "bob-alice".to_string()),
+        "friend1-attest".to_string(),
+    );
+    grb_origin_rename_map.insert(
+        ("friend2".to_string(), "charlie-gb3".to_string()),
+        "gb3".to_string(),
+    );
+    grb_origin_rename_map.insert(
+        ("friend2".to_string(), "charlie-gb4".to_string()),
+        "gb4".to_string(),
+    );
+    grb_origin_rename_map.insert(
+        ("friend2".to_string(), "charlie-alice".to_string()),
+        "friend2-attest".to_string(),
     );
 
-    let schnorrPOD2 = SchnorrPOD::gadget(
-        &vec![entry3.clone(), entry4.clone()],
-        &SchnorrSecretKey { sk: 42 },
-    );
+    let grb_input = GPGInput::new(grb_input_pods, grb_origin_rename_map);
 
-    let schnorrPOD3 = SchnorrPOD::gadget(
-        &vec![entry5.clone(), entry6.clone()],
-        &SchnorrSecretKey { sk: 83 },
-    );
+    let grb_ops = vec![
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("VALUEOF:bob-alice user".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "friend1 attested user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("friend2".to_string()),
+            statement_1_name: Some("VALUEOF:charlie-alice user".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "friend2 attested user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NewEntry,
+            statement_1_parent: None,
+            statement_1_name: None,
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(age_bound_entry.clone()),
+            output_statement_name: "age_bound".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NewEntry,
+            statement_1_parent: None,
+            statement_1_name: None,
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(age_sum_entry.clone()),
+            output_statement_name: "age_sum".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NewEntry,
+            statement_1_parent: None,
+            statement_1_name: None,
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: Some(known_attestors_entry.clone()),
+            output_statement_name: "known_attestors".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("VALUEOF:known_attestors".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("VALUEOF:known_attestors".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "friend1 known_attestors same as _SELF".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::EqualityFromEntries,
+            statement_1_parent: Some("friend2".to_string()),
+            statement_1_name: Some("VALUEOF:known_attestors".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("VALUEOF:known_attestors".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "friend2 known_attestors same as _SELF".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("EQUAL:gb1 attests to correct user".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb1 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::RenameContainedBy,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("CONTAINS:gb1 has known signer".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("EQUAL:friend1 known_attestors same as _SELF".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb1 has known signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("EQUAL:gb2 attests to correct user".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb2 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::RenameContainedBy,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("CONTAINS:gb2 has known signer".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("EQUAL:friend1 known_attestors same as _SELF".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb2 has known signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("NOTEQUAL:gb1 and gb2 are different".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb1 and gb2 are different".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("friend2".to_string()),
+            statement_1_name: Some("EQUAL:gb3 attests to correct user".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb3 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::RenameContainedBy,
+            statement_1_parent: Some("friend2".to_string()),
+            statement_1_name: Some("CONTAINS:gb3 has known signer".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("EQUAL:friend2 known_attestors same as _SELF".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb3 has known signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("friend2".to_string()),
+            statement_1_name: Some("EQUAL:gb4 attests to correct user".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb4 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::RenameContainedBy,
+            statement_1_parent: Some("friend2".to_string()),
+            statement_1_name: Some("CONTAINS:gb4 has known signer".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("EQUAL:friend2 known_attestors same as _SELF".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb4 has known signer".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::CopyStatement,
+            statement_1_parent: Some("friend2".to_string()),
+            statement_1_name: Some("NOTEQUAL:gb3 and gb4 are different".to_string()),
+            statement_2_parent: None,
+            statement_2_name: None,
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "gb4 attests to correct user".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::NonequalityFromEntries,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("VALUEOF:bob-alice signer".to_string()),
+            statement_2_parent: Some("friend2".to_string()),
+            statement_2_name: Some("VALUEOF:charlie-alice signer".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "friend1 and friend2 are different".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::GtFromEntries,
+            statement_1_parent: Some("friend1".to_string()),
+            statement_1_name: Some("VALUEOF:bob age".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("VALUEOF:age_bound".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "friend1 is at least 18".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::GtFromEntries,
+            statement_1_parent: Some("friend2".to_string()),
+            statement_1_name: Some("VALUEOF:charlie age".to_string()),
+            statement_2_parent: Some("_SELF".to_string()),
+            statement_2_name: Some("VALUEOF:age_bound".to_string()),
+            statement_3_parent: None,
+            statement_3_name: None,
+            optional_entry: None,
+            output_statement_name: "friend2 is at least 18".to_string(),
+        },
+        OperationCmd {
+            operation_type: OperationType::SumOf,
+            statement_1_parent: Some("_SELF".to_string()),
+            statement_1_name: Some("VALUEOF:age_sum".to_string()),
+            statement_2_parent: Some("friend1".to_string()),
+            statement_2_name: Some("VALUEOF:bob age".to_string()),
+            statement_3_parent: Some("friend2".to_string()),
+            statement_3_name: Some("VALUEOF:charlie age".to_string()),
+            optional_entry: None,
+            output_statement_name: "sum of friend1 and friend2 ages".to_string(),
+        },
+    ];
 
-    // make a GODPOD using from_pods called on the two schnorr PODs
-    let god_pod_1 = GODPOD::gadget(
-        &vec![
-            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD1.clone()),
-            &SchnorrOrGODPOD::SchnorrPOD(schnorrPOD2.clone()),
-        ],
-        // this Gt operation should fail because 36 is not gt 52
-        &vec![(Operation::GtFromEntries, Some(0), Some(1), None, None)],
-    );
+    let alice_grb = POD::execute_oracle_gadget(&grb_input, &grb_ops).unwrap();
+    assert!(alice_grb.verify()? == true);
+
+    for statement in alice_grb.payload.statements_list {
+        println!("{:?}", statement);
+    }
+
+    Ok(())
 }
